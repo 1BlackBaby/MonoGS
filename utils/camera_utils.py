@@ -21,6 +21,7 @@ class Camera(nn.Module):
         fovy,
         image_height,
         image_width,
+        features=None,
         device="cuda:0",
     ):
         super(Camera, self).__init__()
@@ -35,6 +36,7 @@ class Camera(nn.Module):
 
         self.original_image = color
         self.depth = depth
+        self.features = features
         self.grad_mask = None
 
         self.fx = fx
@@ -64,7 +66,12 @@ class Camera(nn.Module):
 
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
-        gt_color, gt_depth, gt_pose = dataset[idx]
+        data = dataset[idx]
+        if len(data) == 4:
+            gt_color, gt_depth, gt_pose, features = data
+        else:
+            gt_color, gt_depth, gt_pose = data
+            features = None
         return Camera(
             idx,
             gt_color,
@@ -79,6 +86,7 @@ class Camera(nn.Module):
             dataset.fovy,
             dataset.height,
             dataset.width,
+            features=features,
             device=dataset.device,
         )
 
@@ -145,6 +153,7 @@ class Camera(nn.Module):
     def clean(self):
         self.original_image = None
         self.depth = None
+        self.features = None
         self.grad_mask = None
 
         self.cam_rot_delta = None

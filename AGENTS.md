@@ -1,6 +1,10 @@
 # MonoGS 项目知识库 (AGENTS.md)
 
-本项目是一个基于 **3D Gaussian Splatting (3DGS)** 的实时 SLAM 系统，支持单目（Monocular）和 RGB-D 输入。它通过将场景表示为大量可优化的 3D 高斯球，实现了高精度的跟踪（Tracking）和高质量的地图重建（Mapping）。
+本项目是一个基于 **3D Gaussian Splatting (3DGS)** 的实时 SLAM 系统，支持单目（Monocular）和 RGB-D 输入。它通过将场景表示为大量可优化的 3D 高斯球，实现了高精度的跟踪（Tracking）和高质量的地图重建（Mapping）。‘
+
+所有本项目的会话，有以下注意点：
+1. 默认使用中文回答。
+
 
 ---
 

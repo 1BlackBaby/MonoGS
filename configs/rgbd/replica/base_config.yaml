@@ -9,6 +9,8 @@ Results:
 
 Dataset:
   sensor_type: 'depth'
+  feature_path: ""
+  feature_format: "npy"
   pcd_downsample: 64
   pcd_downsample_init: 32
   adaptive_pointsize: True
@@ -56,6 +58,29 @@ Training:
   prune_mode: 'slam'
   single_thread: True
   spherical_harmonics: False
+  uncertainty:
+    enabled: False
+    feature_dim: 384
+    feature_type: "dino"
+    min_uncertainty: 0.1
+    eps: 0.001
+    min_weight_threshold: 0.1
+    train_frac_fix: 0.3
+    ssim_window_size: 7
+    ssim_median_filter_size: 5
+    opacity_th_for_uncer_loss: 0.9
+    reg_stride: 2
+    reg_max_samples: 4096
+    reg_mult: 0.5
+    ssim_mult: 0.5
+    uncer_depth_mult: 0.2
+    lr: 0.0004
+    weight_decay: 0.00001
+    apply_to_tracking_rgb: True
+    apply_to_tracking_depth: False
+    apply_to_mapping_rgb: True
+    apply_to_mapping_depth: True
+    apply_during_init: True
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001

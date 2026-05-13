@@ -18,6 +18,7 @@ from utils.dataset import load_dataset
 from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import FakeQueue
+from utils.dyn_uncertainty import generate_uncertainty_mlp
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
 
@@ -68,6 +69,12 @@ class SLAM:
 
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
+        self.uncer_network = None
+        uncertainty_cfg = self.config.get("Training", {}).get("uncertainty", {})
+        if uncertainty_cfg.get("enabled", False):
+            self.uncer_network = generate_uncertainty_mlp(
+                uncertainty_cfg.get("feature_dim", 384), device="cuda"
+            )
 
         self.frontend = FrontEnd(self.config)
         self.backend = BackEnd(self.config)
@@ -79,6 +86,7 @@ class SLAM:
         self.frontend.backend_queue = backend_queue
         self.frontend.q_main2vis = q_main2vis
         self.frontend.q_vis2main = q_vis2main
+        self.frontend.uncer_network = self.uncer_network
         self.frontend.set_hyperparams()
 
         self.backend.gaussians = self.gaussians
@@ -89,6 +97,7 @@ class SLAM:
         self.backend.frontend_queue = frontend_queue
         self.backend.backend_queue = backend_queue
         self.backend.live_mode = self.live_mode
+        self.backend.uncer_network = self.uncer_network
 
         self.backend.set_hyperparams()
 

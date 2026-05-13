@@ -1,4 +1,7 @@
 import torch
+import torch.nn.functional as F
+
+from utils.dyn_uncertainty import mapping_utils
 
 
 def image_gradient(image):
@@ -53,14 +56,92 @@ def depth_reg(depth, gt_image, huber_eps=0.1, mask=None):
     return err
 
 
-def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=False):
+def uncertainty_enabled(config):
+    return config.get("Training", {}).get("uncertainty", {}).get("enabled", False)
+
+
+def get_uncertainty_config(config):
+    return config.get("Training", {}).get("uncertainty", {})
+
+
+def has_uncertainty_features(viewpoint):
+    return getattr(viewpoint, "features", None) is not None
+
+
+def uncertainty_to_weight(uncertainty, uncertainty_config):
+    min_uncertainty = uncertainty_config.get("min_uncertainty", 0.1)
+    eps = uncertainty_config.get("eps", 1e-3)
+    weights = 0.5 / (torch.clamp(uncertainty, min=min_uncertainty) + eps) ** 2
+    weights = torch.clamp(weights, min=0.0, max=1.0)
+    min_weight_threshold = uncertainty_config.get("min_weight_threshold", 0.1)
+    if min_weight_threshold is not None and min_weight_threshold > 0:
+        weights = torch.where(weights < min_weight_threshold, torch.zeros_like(weights), weights)
+    return weights
+
+
+def predict_uncertainty_weight(
+    uncertainty_network, viewpoint, target_shape, uncertainty_config, no_grad=False
+):
+    if uncertainty_network is None or not has_uncertainty_features(viewpoint):
+        return None, None
+
+    features = viewpoint.features.to(device=next(uncertainty_network.parameters()).device)
+    def _predict():
+        uncertainty = uncertainty_network(features)
+        weight = uncertainty_to_weight(uncertainty, uncertainty_config)
+        weight = F.interpolate(
+            weight[None, None],
+            size=target_shape,
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+        return uncertainty, weight
+
+    if no_grad:
+        with torch.no_grad():
+            return _predict()
+    return _predict()
+
+
+def sample_dino_regularization_inputs(
+    uncertainty, features, uncertainty_config, device
+):
+    reg_stride = max(1, uncertainty_config.get("reg_stride", 2))
+    features = features.reshape(-1, features.shape[-1])
+    uncertainty = uncertainty.reshape(-1, 1)
+    if features.shape[0] == 0 or features.shape[0] != uncertainty.shape[0]:
+        return None, None
+
+    sample_count = max(1, features.shape[0] // (reg_stride**4))
+    reg_max_samples = uncertainty_config.get("reg_max_samples", 4096)
+    if reg_max_samples is not None and reg_max_samples > 0:
+        sample_count = min(sample_count, reg_max_samples)
+    sample_count = min(sample_count, features.shape[0])
+
+    sample_idx = torch.randperm(features.shape[0], device=device)[:sample_count]
+    return uncertainty[sample_idx].unsqueeze(0), features[sample_idx].unsqueeze(0)
+
+
+def get_loss_tracking(
+    config,
+    image,
+    depth,
+    opacity,
+    viewpoint,
+    initialization=False,
+    uncertainty_network=None,
+):
     image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
     if config["Training"]["monocular"]:
-        return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
-    return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
+        return get_loss_tracking_rgb(
+            config, image_ab, depth, opacity, viewpoint, uncertainty_network
+        )
+    return get_loss_tracking_rgbd(
+        config, image_ab, depth, opacity, viewpoint, uncertainty_network=uncertainty_network
+    )
 
 
-def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
+def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint, uncertainty_network=None):
     gt_image = viewpoint.original_image.cuda()
     _, h, w = gt_image.shape
     mask_shape = (1, h, w)
@@ -68,11 +149,22 @@ def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
     l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+    uncertainty_cfg = get_uncertainty_config(config)
+    if (
+        uncertainty_cfg.get("enabled", False)
+        and uncertainty_cfg.get("apply_to_tracking_rgb", True)
+        and uncertainty_network is not None
+    ):
+        _, weights = predict_uncertainty_weight(
+            uncertainty_network, viewpoint, (h, w), uncertainty_cfg, no_grad=True
+        )
+        if weights is not None:
+            l1 = l1 * weights.to(device=l1.device, dtype=l1.dtype)
     return l1.mean()
 
 
 def get_loss_tracking_rgbd(
-    config, image, depth, opacity, viewpoint, initialization=False
+    config, image, depth, opacity, viewpoint, initialization=False, uncertainty_network=None
 ):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
 
@@ -82,13 +174,57 @@ def get_loss_tracking_rgbd(
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
     opacity_mask = (opacity > 0.95).view(*depth.shape)
 
-    l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint)
+    l1_rgb = get_loss_tracking_rgb(
+        config, image, depth, opacity, viewpoint, uncertainty_network
+    )
     depth_mask = depth_pixel_mask * opacity_mask
     l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
+    uncertainty_cfg = get_uncertainty_config(config)
+    if (
+        uncertainty_cfg.get("enabled", False)
+        and uncertainty_cfg.get("apply_to_tracking_depth", False)
+        and uncertainty_network is not None
+    ):
+        _, weights = predict_uncertainty_weight(
+            uncertainty_network,
+            viewpoint,
+            depth.shape[-2:],
+            uncertainty_cfg,
+            no_grad=True,
+        )
+        if weights is not None:
+            l1_depth = l1_depth * weights.to(device=l1_depth.device, dtype=l1_depth.dtype)
     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
 
-def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False):
+def get_loss_mapping(
+    config,
+    image,
+    depth,
+    viewpoint,
+    opacity,
+    initialization=False,
+    uncertainty_network=None,
+    regularization_viewpoints=None,
+):
+    uncertainty_cfg = get_uncertainty_config(config)
+    if (
+        uncertainty_cfg.get("enabled", False)
+        and uncertainty_network is not None
+        and has_uncertainty_features(viewpoint)
+        and (not initialization or uncertainty_cfg.get("apply_during_init", True))
+    ):
+        return get_loss_mapping_uncertainty(
+            config,
+            image,
+            depth,
+            viewpoint,
+            opacity,
+            uncertainty_network,
+            initialization,
+            regularization_viewpoints=regularization_viewpoints,
+        )
+
     if initialization:
         image_ab = image
     else:
@@ -96,6 +232,102 @@ def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=Fa
     if config["Training"]["monocular"]:
         return get_loss_mapping_rgb(config, image_ab, depth, viewpoint)
     return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
+
+
+def get_loss_mapping_uncertainty(
+    config,
+    image,
+    depth,
+    viewpoint,
+    opacity,
+    uncertainty_network,
+    initialization=False,
+    regularization_viewpoints=None,
+):
+    if initialization:
+        image_ab = image
+    else:
+        image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
+
+    uncertainty_cfg = get_uncertainty_config(config)
+    gt_image = viewpoint.original_image.cuda()
+    _, h, w = gt_image.shape
+    mask_shape = (1, h, w)
+    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
+    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
+
+    if viewpoint.depth is None:
+        ref_depth = depth.detach()
+    else:
+        ref_depth = torch.from_numpy(viewpoint.depth).to(
+            dtype=torch.float32, device=image.device
+        )[None]
+
+    features = viewpoint.features.to(device=image.device)
+    uncertainty = uncertainty_network(features)
+    uncer_loss, resized_uncertainty, l1_rgb, l1_depth = (
+        mapping_utils.compute_mapping_loss_components(
+            gt_image,
+            image_ab,
+            ref_depth,
+            depth,
+            uncertainty,
+            opacity.view(*mask_shape),
+            train_fraction=uncertainty_cfg.get("train_frac_fix", 0.3),
+            ssim_fraction=uncertainty_cfg.get("train_frac_fix", 0.3),
+            uncertainty_config=uncertainty_cfg,
+            mask=rgb_pixel_mask,
+        )
+    )
+
+    weights = uncertainty_to_weight(resized_uncertainty, uncertainty_cfg).view(*mask_shape)
+    if uncertainty_cfg.get("apply_to_mapping_rgb", True):
+        l1_rgb = l1_rgb * weights
+
+    if uncertainty_cfg.get("apply_to_mapping_depth", True):
+        l1_depth = l1_depth * weights
+
+    alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
+    if config["Training"]["monocular"]:
+        loss = l1_rgb.mean()
+    else:
+        loss = alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
+
+    ssim_mult = uncertainty_cfg.get("ssim_mult", 0.5)
+    loss = loss + ssim_mult * uncer_loss.mean()
+
+    reg_mult = uncertainty_cfg.get("reg_mult", 0.5)
+    if reg_mult > 0:
+        local_features = [features]
+        if regularization_viewpoints is not None:
+            for reg_viewpoint in regularization_viewpoints:
+                if reg_viewpoint is viewpoint or not has_uncertainty_features(reg_viewpoint):
+                    continue
+                local_features.append(reg_viewpoint.features.to(device=image.device))
+
+        feature_dim = features.shape[-1]
+        feature_samples = torch.cat(
+            [
+                local_feature[:: max(1, uncertainty_cfg.get("reg_stride", 2)), :: max(1, uncertainty_cfg.get("reg_stride", 2))]
+                .reshape(-1, feature_dim)
+                for local_feature in local_features
+            ],
+            dim=0,
+        )
+        sampled_feature_input = feature_samples.reshape(1, feature_samples.shape[0], 1, feature_dim)
+        sampled_uncertainty_full = uncertainty_network(sampled_feature_input).reshape(-1, 1)
+        sampled_uncertainty, sampled_features = sample_dino_regularization_inputs(
+            sampled_uncertainty_full,
+            feature_samples,
+            uncertainty_cfg,
+            image.device,
+        )
+        if sampled_uncertainty is not None:
+            loss = loss + reg_mult * mapping_utils.compute_dino_regularization_loss(
+                sampled_uncertainty,
+                sampled_features,
+            )
+    return loss
 
 
 def get_loss_mapping_rgb(config, image, depth, viewpoint):

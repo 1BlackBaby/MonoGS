@@ -42,6 +42,7 @@ class FrontEnd(mp.Process):
         self.cameras = dict()
         self.device = "cuda:0"
         self.pause = False
+        self.uncer_network = None
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -171,7 +172,12 @@ class FrontEnd(mp.Process):
             )
             pose_optimizer.zero_grad()
             loss_tracking = get_loss_tracking(
-                self.config, image, depth, opacity, viewpoint
+                self.config,
+                image,
+                depth,
+                opacity,
+                viewpoint,
+                uncertainty_network=self.uncer_network,
             )
             loss_tracking.backward()
 
@@ -303,10 +309,16 @@ class FrontEnd(mp.Process):
         self.gaussians = data[1]
         occ_aware_visibility = data[2]
         keyframes = data[3]
+        uncer_state = data[4] if len(data) > 4 else None
         self.occ_aware_visibility = occ_aware_visibility
 
         for kf_id, kf_R, kf_T in keyframes:
             self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
+        if self.uncer_network is not None and uncer_state is not None:
+            self.uncer_network.load_state_dict(
+                {k: v.to(self.device) for k, v in uncer_state.items()}
+            )
+            self.uncer_network.eval()
 
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()

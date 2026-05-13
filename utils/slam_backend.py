@@ -37,6 +37,8 @@ class BackEnd(mp.Process):
         self.current_window = []
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
+        self.uncer_network = None
+        self.uncer_optimizer = None
 
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
@@ -63,6 +65,13 @@ class BackEnd(mp.Process):
             if "single_thread" in self.config["Dataset"]
             else False
         )
+        self.uncertainty_cfg = self.config.get("Training", {}).get("uncertainty", {})
+        if self.uncertainty_cfg.get("enabled", False) and self.uncer_network is not None:
+            self.uncer_optimizer = torch.optim.Adam(
+                self.uncer_network.parameters(),
+                lr=self.uncertainty_cfg.get("lr", 0.0004),
+                weight_decay=self.uncertainty_cfg.get("weight_decay", 0.00001),
+            )
 
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
         self.gaussians.extend_from_pcd_seq(
@@ -107,7 +116,13 @@ class BackEnd(mp.Process):
                 render_pkg["n_touched"],
             )
             loss_init = get_loss_mapping(
-                self.config, image, depth, viewpoint, opacity, initialization=True
+                self.config,
+                image,
+                depth,
+                viewpoint,
+                opacity,
+                initialization=True,
+                uncertainty_network=self.uncer_network,
             )
             loss_init.backward()
 
@@ -134,6 +149,9 @@ class BackEnd(mp.Process):
 
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+                if self.uncer_optimizer is not None:
+                    self.uncer_optimizer.step()
+                    self.uncer_optimizer.zero_grad(set_to_none=True)
 
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
@@ -190,7 +208,15 @@ class BackEnd(mp.Process):
                 )
 
                 loss_mapping += get_loss_mapping(
-                    self.config, image, depth, viewpoint, opacity
+                    self.config,
+                    image,
+                    depth,
+                    viewpoint,
+                    opacity,
+                    uncertainty_network=self.uncer_network,
+                    regularization_viewpoints=viewpoint_stack[
+                        max(0, cam_idx - 2) : min(len(viewpoint_stack), cam_idx + 3)
+                    ],
                 )
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
@@ -220,7 +246,13 @@ class BackEnd(mp.Process):
                     render_pkg["n_touched"],
                 )
                 loss_mapping += get_loss_mapping(
-                    self.config, image, depth, viewpoint, opacity
+                    self.config,
+                    image,
+                    depth,
+                    viewpoint,
+                    opacity,
+                    uncertainty_network=self.uncer_network,
+                    regularization_viewpoints=viewpoint_stack[: min(len(viewpoint_stack), 5)],
                 )
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
@@ -272,6 +304,8 @@ class BackEnd(mp.Process):
                             self.initialized = True
                             Log("Initialized SLAM")
                         # # make sure we don't split the gaussians, break here.
+                    if self.uncer_optimizer is not None:
+                        self.uncer_optimizer.zero_grad(set_to_none=True)
                     return False
 
                 for idx in range(len(viewspace_point_tensor_acm)):
@@ -309,6 +343,9 @@ class BackEnd(mp.Process):
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
+                if self.uncer_optimizer is not None:
+                    self.uncer_optimizer.step()
+                    self.uncer_optimizer.zero_grad(set_to_none=True)
                 # Pose update
                 for cam_idx in range(min(frames_to_optimize, len(current_window))):
                     viewpoint = viewpoint_stack[cam_idx]
@@ -361,7 +398,12 @@ class BackEnd(mp.Process):
         if tag is None:
             tag = "sync_backend"
 
-        msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes]
+        uncer_state = None
+        if self.uncer_network is not None:
+            uncer_state = {
+                k: v.detach().cpu() for k, v in self.uncer_network.state_dict().items()
+            }
+        msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes, uncer_state]
         self.frontend_queue.put(msg)
 
     def run(self):
