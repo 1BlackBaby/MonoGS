@@ -1,0 +1,86 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Python environments
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.conda/
+
+# Editors and OS metadata
+.idea/
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Build and extension artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.pyd
+*.dll
+*.lib
+*.exp
+*.o
+*.obj
+*.ptx
+*.cubin
+*.cache
+
+# CUDA/PyTorch extension build outputs
+diff_rasterization/dist/
+diff_rasterization/build/
+diff_rasterization/*.egg-info/
+gaussian_splatting/**/build/
+submodules/**/build/
+submodules/**/*.egg-info/
+
+# Logs and experiment trackers
+*.log
+logs/
+log/
+wandb/
+tensorboard/
+events.out.tfevents*
+
+# Datasets, generated outputs, checkpoints, and reconstruction artifacts
+datasets/
+data/
+output/
+outputs/
+result*/
+results/
+runs/
+checkpoints/
+ckpts/
+cameras.json
+*.ply
+*.pcd
+*.las
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Notebook checkpoints
+.ipynb_checkpoints/
