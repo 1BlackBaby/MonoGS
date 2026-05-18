@@ -48,6 +48,20 @@ class GaussianModel:
         self.unique_kfIDs = torch.empty(0).int()
         self.n_obs = torch.empty(0).int()
 
+        self.config = config
+        self.ply_input = None
+
+        self.isotropic = False
+        self.forgetting_enabled = (
+            config is not None
+            and config.get("Training", {})
+            .get("forgetting_regularization", {})
+            .get("enabled", False)
+        )
+        self._clear_forgetting_statistics()
+        if self.forgetting_enabled:
+            self._init_empty_forgetting_statistics()
+
         self.optimizer = None
 
         self.scaling_activation = torch.exp
@@ -59,11 +73,6 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
-
-        self.config = config
-        self.ply_input = None
-
-        self.isotropic = False
 
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
@@ -104,13 +113,25 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_pcd_from_image(self, cam_info, init=False, scale=2.0, depthmap=None):
+    def create_pcd_from_image(
+        self,
+        cam_info,
+        init=False,
+        scale=2.0,
+        depthmap=None,
+        mask=None,
+        opacity_value=0.5,
+        use_valid_depth_median=False,
+    ):
         cam = cam_info
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
         image_ab = torch.clamp(image_ab, 0.0, 1.0)
         rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
 
         if depthmap is not None:
+            if mask is not None:
+                depthmap = depthmap.copy()
+                depthmap[~mask.astype(bool)] = 0.0
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depthmap.astype(np.float32))
         else:
@@ -125,12 +146,31 @@ class GaussianModel:
                     * 0.05
                 ) * scale
 
+            if mask is not None:
+                depth_raw = depth_raw.copy()
+                depth_raw[~mask.astype(bool)] = 0.0
+
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depth_raw.astype(np.float32))
 
-        return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
+        return self.create_pcd_from_image_and_depth(
+            cam,
+            rgb,
+            depth,
+            init,
+            opacity_value=opacity_value,
+            use_valid_depth_median=use_valid_depth_median,
+        )
 
-    def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False):
+    def create_pcd_from_image_and_depth(
+        self,
+        cam,
+        rgb,
+        depth,
+        init=False,
+        opacity_value=0.5,
+        use_valid_depth_median=False,
+    ):
         if init:
             downsample_factor = self.config["Dataset"]["pcd_downsample_init"]
         else:
@@ -138,7 +178,13 @@ class GaussianModel:
         point_size = self.config["Dataset"]["point_size"]
         if "adaptive_pointsize" in self.config["Dataset"]:
             if self.config["Dataset"]["adaptive_pointsize"]:
-                point_size = min(0.05, point_size * np.median(depth))
+                if use_valid_depth_median:
+                    depth_values = np.asarray(depth)
+                    valid_depth = depth_values[depth_values > 0]
+                    if valid_depth.shape[0] > 0:
+                        point_size = min(0.05, point_size * np.median(valid_depth))
+                else:
+                    point_size = min(0.05, point_size * np.median(depth))
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             rgb,
             depth,
@@ -164,6 +210,24 @@ class GaussianModel:
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
+
+        if new_xyz.shape[0] == 0:
+            empty_xyz = torch.empty(0, 3, device="cuda")
+            empty_features = torch.empty(
+                0, 3, (self.max_sh_degree + 1) ** 2, device="cuda"
+            )
+            empty_scaling = torch.empty(0, 3, device="cuda")
+            if self.isotropic:
+                empty_scaling = torch.empty(0, 1, device="cuda")
+            empty_rotation = torch.empty(0, 4, device="cuda")
+            empty_opacity = torch.empty(0, 1, device="cuda")
+            return (
+                empty_xyz,
+                empty_features,
+                empty_scaling,
+                empty_rotation,
+                empty_opacity,
+            )
 
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
@@ -193,8 +257,9 @@ class GaussianModel:
 
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
+        opacity_value = float(np.clip(opacity_value, 0.0001, 0.9999))
         opacities = inverse_sigmoid(
-            0.5
+            opacity_value
             * torch.ones(
                 (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
             )
@@ -206,8 +271,18 @@ class GaussianModel:
         self.spatial_lr_scale = spatial_lr_scale
 
     def extend_from_pcd(
-        self, fused_point_cloud, features, scales, rots, opacities, kf_id
+        self,
+        fused_point_cloud,
+        features,
+        scales,
+        rots,
+        opacities,
+        kf_id,
+        reset_densification_stats=True,
     ):
+        if fused_point_cloud.shape[0] == 0:
+            return 0
+
         new_xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         new_features_dc = nn.Parameter(
             features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
@@ -230,16 +305,41 @@ class GaussianModel:
             new_rotation,
             new_kf_ids=new_unique_kfIDs,
             new_n_obs=new_n_obs,
+            reset_densification_stats=reset_densification_stats,
         )
+        return new_xyz.shape[0]
 
     def extend_from_pcd_seq(
-        self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None
+        self,
+        cam_info,
+        kf_id=-1,
+        init=False,
+        scale=2.0,
+        depthmap=None,
+        mask=None,
+        reset_densification_stats=True,
+        opacity_value=0.5,
+        use_valid_depth_median=False,
     ):
         fused_point_cloud, features, scales, rots, opacities = (
-            self.create_pcd_from_image(cam_info, init, scale=scale, depthmap=depthmap)
+            self.create_pcd_from_image(
+                cam_info,
+                init,
+                scale=scale,
+                depthmap=depthmap,
+                mask=mask,
+                opacity_value=opacity_value,
+                use_valid_depth_median=use_valid_depth_median,
+            )
         )
-        self.extend_from_pcd(
-            fused_point_cloud, features, scales, rots, opacities, kf_id
+        return self.extend_from_pcd(
+            fused_point_cloud,
+            features,
+            scales,
+            rots,
+            opacities,
+            kf_id,
+            reset_densification_stats=reset_densification_stats,
         )
 
     def training_setup(self, training_args):
@@ -464,6 +564,218 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
         self.unique_kfIDs = torch.zeros((self._xyz.shape[0]))
         self.n_obs = torch.zeros((self._xyz.shape[0]), device="cpu").int()
+        self.reset_forgetting_statistics()
+
+    def _clear_forgetting_statistics(self):
+        self.seen_times = None
+        self.last_xyz = None
+        self.last_features_dc = None
+        self.last_scaling = None
+        self.last_opacity = None
+        self.xyz_importance_weights = None
+        self.features_dc_importance_weights = None
+        self.scaling_importance_weights = None
+        self.opacity_importance_weights = None
+
+    def _init_empty_forgetting_statistics(self):
+        self.seen_times = torch.empty(0, 1, device="cuda")
+        self.last_xyz = torch.empty(0, 3, device="cuda")
+        self.last_features_dc = torch.empty(0, 1, 3, device="cuda")
+        self.last_scaling = torch.empty(0, 3, device="cuda")
+        self.last_opacity = torch.empty(0, 1, device="cuda")
+        self.xyz_importance_weights = torch.empty(0, 3, device="cuda")
+        self.features_dc_importance_weights = torch.empty(0, 1, 3, device="cuda")
+        self.scaling_importance_weights = torch.empty(0, 3, device="cuda")
+        self.opacity_importance_weights = torch.empty(0, 1, device="cuda")
+
+    def reset_forgetting_statistics(self):
+        if not self.forgetting_enabled:
+            self._clear_forgetting_statistics()
+            return
+        self.seen_times = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.last_xyz = self._xyz.detach().clone()
+        self.last_features_dc = self._features_dc.detach().clone()
+        self.last_scaling = self._scaling.detach().clone()
+        self.last_opacity = self._opacity.detach().clone()
+        self.xyz_importance_weights = torch.zeros_like(self._xyz)
+        self.features_dc_importance_weights = torch.zeros_like(self._features_dc)
+        self.scaling_importance_weights = torch.zeros_like(self._scaling)
+        self.opacity_importance_weights = torch.zeros_like(self._opacity)
+
+    def _ensure_forgetting_statistics(self):
+        if not self.forgetting_enabled:
+            return
+        if self.seen_times is None or self.seen_times.shape[0] != self.get_xyz.shape[0]:
+            self.reset_forgetting_statistics()
+
+    def _append_forgetting_statistics(
+        self, new_xyz, new_features_dc, new_scaling, new_opacity
+    ):
+        if not self.forgetting_enabled:
+            return
+        self._ensure_forgetting_statistics()
+        count = new_xyz.shape[0]
+        if count == 0:
+            return
+        self.seen_times = torch.cat(
+            (self.seen_times, torch.zeros((count, 1), device="cuda")), dim=0
+        )
+        self.last_xyz = torch.cat((self.last_xyz, new_xyz.detach().clone()), dim=0)
+        self.last_features_dc = torch.cat(
+            (self.last_features_dc, new_features_dc.detach().clone()), dim=0
+        )
+        self.last_scaling = torch.cat(
+            (self.last_scaling, new_scaling.detach().clone()), dim=0
+        )
+        self.last_opacity = torch.cat(
+            (self.last_opacity, new_opacity.detach().clone()), dim=0
+        )
+        self.xyz_importance_weights = torch.cat(
+            (self.xyz_importance_weights, torch.zeros_like(new_xyz)), dim=0
+        )
+        self.features_dc_importance_weights = torch.cat(
+            (
+                self.features_dc_importance_weights,
+                torch.zeros_like(new_features_dc),
+            ),
+            dim=0,
+        )
+        self.scaling_importance_weights = torch.cat(
+            (self.scaling_importance_weights, torch.zeros_like(new_scaling)), dim=0
+        )
+        self.opacity_importance_weights = torch.cat(
+            (self.opacity_importance_weights, torch.zeros_like(new_opacity)), dim=0
+        )
+
+    def _prune_forgetting_statistics(self, valid_points_mask):
+        if not self.forgetting_enabled:
+            return
+        self._ensure_forgetting_statistics()
+        mask = valid_points_mask.to(device="cuda")
+        self.seen_times = self.seen_times[mask]
+        self.last_xyz = self.last_xyz[mask]
+        self.last_features_dc = self.last_features_dc[mask]
+        self.last_scaling = self.last_scaling[mask]
+        self.last_opacity = self.last_opacity[mask]
+        self.xyz_importance_weights = self.xyz_importance_weights[mask]
+        self.features_dc_importance_weights = self.features_dc_importance_weights[
+            mask
+        ]
+        self.scaling_importance_weights = self.scaling_importance_weights[
+            mask
+        ]
+        self.opacity_importance_weights = self.opacity_importance_weights[
+            mask
+        ]
+
+    def capture_forgetting_snapshot(self):
+        if not self.forgetting_enabled:
+            return
+        self._ensure_forgetting_statistics()
+        self.last_xyz = self._xyz.detach().clone()
+        self.last_features_dc = self._features_dc.detach().clone()
+        self.last_scaling = self._scaling.detach().clone()
+        self.last_opacity = self._opacity.detach().clone()
+
+    def update_forgetting_importance(self, visibility_filters, normalize=True):
+        if not self.forgetting_enabled:
+            return
+        self._ensure_forgetting_statistics()
+        if self.get_xyz.shape[0] == 0:
+            return
+
+        visible = torch.zeros((self.get_xyz.shape[0]), dtype=torch.bool, device="cuda")
+        for visibility_filter in visibility_filters:
+            if visibility_filter.shape[0] != visible.shape[0]:
+                print(
+                    "Warning: skipping forgetting importance update due to "
+                    "visibility/gaussian shape mismatch."
+                )
+                return
+            visible = torch.logical_or(visible, visibility_filter)
+        if not visible.any():
+            return
+
+        self.seen_times[visible] += 1
+        seen_count = torch.clamp(self.seen_times, min=1.0)
+
+        if self._xyz.grad is not None:
+            xyz_grad = torch.abs(self._xyz.grad.detach())
+            if normalize:
+                self.xyz_importance_weights[visible] = (
+                    self.xyz_importance_weights[visible]
+                    * (self.seen_times[visible] - 1)
+                    + xyz_grad[visible]
+                ) / seen_count[visible]
+            else:
+                self.xyz_importance_weights[visible] += xyz_grad[visible]
+
+        if self._features_dc.grad is not None:
+            features_grad = torch.abs(self._features_dc.grad.detach())
+            if normalize:
+                self.features_dc_importance_weights[visible] = (
+                    self.features_dc_importance_weights[visible]
+                    * (self.seen_times[visible].view(-1, 1, 1) - 1)
+                    + features_grad[visible]
+                ) / seen_count[visible].view(-1, 1, 1)
+            else:
+                self.features_dc_importance_weights[visible] += features_grad[visible]
+
+        if self._scaling.grad is not None:
+            scaling_grad = torch.abs(self._scaling.grad.detach())
+            if normalize:
+                self.scaling_importance_weights[visible] = (
+                    self.scaling_importance_weights[visible]
+                    * (self.seen_times[visible] - 1)
+                    + scaling_grad[visible]
+                ) / seen_count[visible]
+            else:
+                self.scaling_importance_weights[visible] += scaling_grad[visible]
+
+        if self._opacity.grad is not None:
+            opacity_grad = torch.abs(self._opacity.grad.detach())
+            if normalize:
+                self.opacity_importance_weights[visible] = (
+                    self.opacity_importance_weights[visible]
+                    * (self.seen_times[visible] - 1)
+                    + opacity_grad[visible]
+                ) / seen_count[visible]
+            else:
+                self.opacity_importance_weights[visible] += opacity_grad[visible]
+
+    def forgetting_regularization_loss(self, cfg):
+        if not self.forgetting_enabled:
+            return self.get_xyz.sum() * 0.0
+        self._ensure_forgetting_statistics()
+        if self.get_xyz.shape[0] == 0:
+            return self.get_xyz.sum() * 0.0
+
+        loss = self.get_xyz.sum() * 0.0
+        lambda_color = cfg.get("lambda_color", 0.01)
+        lambda_scaling = cfg.get("lambda_scaling", 0.01)
+        lambda_xyz = cfg.get("lambda_xyz", 0.0)
+        lambda_opacity = cfg.get("lambda_opacity", 0.0)
+
+        if lambda_color > 0:
+            loss = loss + lambda_color * (
+                self.features_dc_importance_weights
+                * torch.abs(self._features_dc - self.last_features_dc)
+            ).mean()
+        if lambda_scaling > 0:
+            loss = loss + lambda_scaling * (
+                self.scaling_importance_weights
+                * torch.abs(self._scaling - self.last_scaling)
+            ).mean()
+        if lambda_xyz > 0:
+            loss = loss + lambda_xyz * (
+                self.xyz_importance_weights * torch.abs(self._xyz - self.last_xyz)
+            ).mean()
+        if lambda_opacity > 0:
+            loss = loss + lambda_opacity * (
+                self.opacity_importance_weights
+                * torch.abs(self._opacity - self.last_opacity)
+            ).mean()
+        return loss
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -504,6 +816,7 @@ class GaussianModel:
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
+        self._prune_forgetting_statistics(valid_points_mask)
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -564,7 +877,15 @@ class GaussianModel:
         new_rotation,
         new_kf_ids=None,
         new_n_obs=None,
+        reset_densification_stats=True,
     ):
+        self._append_forgetting_statistics(
+            new_xyz, new_features_dc, new_scaling, new_opacities
+        )
+        old_xyz_gradient_accum = self.xyz_gradient_accum
+        old_denom = self.denom
+        old_max_radii2D = self.max_radii2D
+
         d = {
             "xyz": new_xyz,
             "f_dc": new_features_dc,
@@ -582,9 +903,31 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if reset_densification_stats or old_xyz_gradient_accum.shape[0] == 0:
+            self.xyz_gradient_accum = torch.zeros(
+                (self.get_xyz.shape[0], 1), device="cuda"
+            )
+            self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        else:
+            self.xyz_gradient_accum = torch.cat(
+                (
+                    old_xyz_gradient_accum,
+                    torch.zeros((new_xyz.shape[0], 1), device="cuda"),
+                ),
+                dim=0,
+            )
+            self.denom = torch.cat(
+                (old_denom, torch.zeros((new_xyz.shape[0], 1), device="cuda")),
+                dim=0,
+            )
+            self.max_radii2D = torch.cat(
+                (
+                    old_max_radii2D,
+                    torch.zeros((new_xyz.shape[0]), device="cuda"),
+                ),
+                dim=0,
+            )
         if new_kf_ids is not None:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
         if new_n_obs is not None:

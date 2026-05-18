@@ -68,6 +68,30 @@ Training:
     apply_to_mapping_rgb: True
     apply_to_mapping_depth: True
     apply_during_init: True
+  render_guided_densification:
+    enabled: False
+    use_opacity_hole: True
+    use_rgb_error: True
+    use_depth_error: False
+    opacity_threshold: 0.5
+    rgb_error_threshold: 0.25
+    depth_error_ratio_threshold: 0.1
+    max_new_points_per_kf: 3000
+    max_new_points_per_update: 3000
+    min_depth: 0.01
+    trigger_every: 150
+    trigger_offset: 50
+    downsample: 1
+    initial_opacity: 0.8
+  forgetting_regularization:
+    enabled: False
+    update_every_kf: 1
+    lambda_color: 0.01
+    lambda_scaling: 0.01
+    lambda_xyz: 0.0
+    lambda_opacity: 0.0
+    max_history_views: 3
+    normalize_importance: True
 
   lr:
     cam_rot_delta: 0.003

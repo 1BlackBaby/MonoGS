@@ -40,6 +40,73 @@ class BackEnd(mp.Process):
         self.uncer_network = None
         self.uncer_optimizer = None
 
+    def _require_nonnegative_number(self, cfg, key, display_key):
+        value = cfg.get(key)
+        if value is None or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"Training.{display_key} must be a non-negative number")
+        return value
+
+    def _load_render_guided_config(self):
+        cfg = self.config.get("Training", {}).get("render_guided_densification", {})
+        if not cfg.get("enabled", False):
+            return cfg
+
+        for key in ("opacity_threshold", "rgb_error_threshold", "min_depth"):
+            self._require_nonnegative_number(
+                cfg, key, f"render_guided_densification.{key}"
+            )
+        for key in ("max_new_points_per_kf", "max_new_points_per_update"):
+            value = cfg.get(key, cfg.get("max_new_points_per_kf", 3000))
+            if not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"Training.render_guided_densification.{key} must be a non-negative integer"
+                )
+        for key in ("trigger_every", "downsample"):
+            value = cfg.get(key)
+            if not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"Training.render_guided_densification.{key} must be an integer >= 1"
+                )
+        trigger_offset = cfg.get("trigger_offset")
+        if not isinstance(trigger_offset, int) or trigger_offset < 0:
+            raise ValueError(
+                "Training.render_guided_densification.trigger_offset must be a non-negative integer"
+            )
+        initial_opacity = cfg.get("initial_opacity", 0.8)
+        if (
+            not isinstance(initial_opacity, (int, float))
+            or initial_opacity <= 0
+            or initial_opacity >= 1
+        ):
+            raise ValueError(
+                "Training.render_guided_densification.initial_opacity must be in (0, 1)"
+            )
+        if cfg.get("use_depth_error", False):
+            self._require_nonnegative_number(
+                cfg,
+                "depth_error_ratio_threshold",
+                "render_guided_densification.depth_error_ratio_threshold",
+            )
+        return cfg
+
+    def _load_forgetting_regularization_config(self):
+        cfg = self.config.get("Training", {}).get("forgetting_regularization", {})
+        if not cfg.get("enabled", False):
+            return cfg
+
+        update_every = cfg.get("update_every_kf", 1)
+        if not isinstance(update_every, int) or update_every < 1:
+            raise ValueError(
+                "Training.forgetting_regularization.update_every_kf must be an integer >= 1"
+            )
+        for key in ("lambda_color", "lambda_scaling", "lambda_xyz", "lambda_opacity"):
+            value = cfg.get(key, 0.0)
+            if not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(
+                    f"Training.forgetting_regularization.{key} must be a non-negative number"
+                )
+        return cfg
+
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
 
@@ -66,6 +133,8 @@ class BackEnd(mp.Process):
             else False
         )
         self.uncertainty_cfg = self.config.get("Training", {}).get("uncertainty", {})
+        self.render_guided_cfg = self._load_render_guided_config()
+        self.forgetting_reg_cfg = self._load_forgetting_regularization_config()
         if self.uncertainty_cfg.get("enabled", False) and self.uncer_network is not None:
             self.uncer_optimizer = torch.optim.Adam(
                 self.uncer_network.parameters(),
@@ -74,9 +143,126 @@ class BackEnd(mp.Process):
             )
 
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
-        self.gaussians.extend_from_pcd_seq(
+        return self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
         )
+
+    def add_render_guided_gaussians(
+        self, frame_idx, viewpoint, image, depth, opacity, max_new_points
+    ):
+        cfg = self.render_guided_cfg
+        if not cfg.get("enabled", False) or max_new_points <= 0:
+            return 0
+
+        with torch.no_grad():
+            gt_image = viewpoint.original_image.to(device=image.device)
+            image_ab = torch.exp(viewpoint.exposure_a) * image + viewpoint.exposure_b
+            image_ab = torch.clamp(image_ab, 0.0, 1.0)
+            rgb_error_map = torch.abs(image_ab - gt_image).mean(dim=0)
+            opacity_map = opacity.squeeze()
+
+            densify_mask = torch.zeros_like(opacity_map, dtype=torch.bool)
+            score_map = torch.zeros_like(opacity_map, dtype=rgb_error_map.dtype)
+            if cfg.get("use_opacity_hole", True):
+                opacity_score = torch.clamp(
+                    cfg.get("opacity_threshold", 0.5) - opacity_map, min=0.0
+                )
+                densify_mask = torch.logical_or(
+                    densify_mask,
+                    opacity_map < cfg.get("opacity_threshold", 0.5),
+                )
+                score_map = score_map + opacity_score
+            if cfg.get("use_rgb_error", True):
+                rgb_score = torch.clamp(
+                    rgb_error_map - cfg.get("rgb_error_threshold", 0.25), min=0.0
+                )
+                densify_mask = torch.logical_or(
+                    densify_mask,
+                    rgb_error_map > cfg.get("rgb_error_threshold", 0.25),
+                )
+                score_map = score_map + rgb_score
+
+            if cfg.get("use_depth_error", False) and viewpoint.depth is not None:
+                gt_depth_for_error = torch.from_numpy(viewpoint.depth).to(
+                    dtype=torch.float32, device=image.device
+                )
+                depth_diff_ratio = torch.abs(gt_depth_for_error - depth.squeeze()) / (
+                    gt_depth_for_error + 1e-6
+                )
+                depth_score = torch.clamp(
+                    depth_diff_ratio
+                    - cfg.get("depth_error_ratio_threshold", 0.1),
+                    min=0.0,
+                )
+                densify_mask = torch.logical_or(
+                    densify_mask,
+                    depth_diff_ratio > cfg.get("depth_error_ratio_threshold", 0.1),
+                )
+                score_map = score_map + depth_score
+
+            rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
+            valid_rgb = gt_image.sum(dim=0) > rgb_boundary_threshold
+            densify_mask = torch.logical_and(densify_mask, valid_rgb)
+
+            if viewpoint.depth is not None:
+                depth_source = torch.from_numpy(viewpoint.depth).to(
+                    dtype=torch.float32, device=image.device
+                )
+            else:
+                depth_source = depth.squeeze().detach()
+            min_depth = cfg.get("min_depth", 0.01)
+            densify_mask = torch.logical_and(densify_mask, depth_source > min_depth)
+
+            downsample = max(1, int(cfg.get("downsample", 1)))
+            if downsample > 1:
+                grid_y = torch.arange(
+                    densify_mask.shape[0], device=densify_mask.device
+                ).view(-1, 1)
+                grid_x = torch.arange(
+                    densify_mask.shape[1], device=densify_mask.device
+                ).view(1, -1)
+                sample_mask = torch.logical_and(
+                    grid_y % downsample == 0, grid_x % downsample == 0
+                )
+                densify_mask = torch.logical_and(densify_mask, sample_mask)
+
+            selected_count = int(densify_mask.count_nonzero().item())
+            if selected_count == 0:
+                return 0
+
+            if max_new_points > 0 and selected_count > max_new_points:
+                candidate_idx = densify_mask.flatten().nonzero(as_tuple=False).squeeze(1)
+                candidate_score = score_map.flatten()[candidate_idx]
+                if torch.any(candidate_score > 0):
+                    topk = torch.topk(
+                        candidate_score, k=max_new_points, largest=True
+                    ).indices
+                else:
+                    topk = torch.arange(
+                        max_new_points, device=candidate_idx.device
+                    )
+                limited_mask = torch.zeros_like(densify_mask.flatten(), dtype=torch.bool)
+                limited_mask[candidate_idx[topk]] = True
+                densify_mask = limited_mask.view_as(densify_mask)
+
+            mask_np = densify_mask.detach().cpu().numpy().astype(bool)
+            depth_np = depth_source.detach().cpu().numpy().astype("float32")
+
+        added = self.gaussians.extend_from_pcd_seq(
+            viewpoint,
+            kf_id=frame_idx,
+            init=False,
+            depthmap=depth_np,
+            mask=mask_np,
+            reset_densification_stats=False,
+            opacity_value=cfg.get(
+                "initial_opacity", max(0.5, float(self.gaussian_th) + 0.05)
+            ),
+            use_valid_depth_median=True,
+        )
+        if added > 0:
+            Log("Render-guided densification added", added, "Gaussians")
+        return added
 
     def reset(self):
         self.iteration_count = 0
@@ -88,6 +274,7 @@ class BackEnd(mp.Process):
 
         # remove all gaussians
         self.gaussians.prune_points(self.gaussians.unique_kfIDs >= 0)
+        self.gaussians.reset_forgetting_statistics()
         # remove everything from the queues
         while not self.backend_queue.empty():
             self.backend_queue.get()
@@ -171,6 +358,8 @@ class BackEnd(mp.Process):
                 continue
             random_viewpoint_stack.append(viewpoint)
 
+        render_guided_enabled = self.render_guided_cfg.get("enabled", False)
+
         for _ in range(iters):
             self.iteration_count += 1
             self.last_sent += 1
@@ -180,6 +369,7 @@ class BackEnd(mp.Process):
             visibility_filter_acm = []
             radii_acm = []
             n_touched_acm = []
+            render_guided_candidates = [] if render_guided_enabled else None
 
             keyframes_opt = []
 
@@ -222,6 +412,16 @@ class BackEnd(mp.Process):
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
                 n_touched_acm.append(n_touched)
+                if render_guided_enabled:
+                    render_guided_candidates.append(
+                        (
+                            viewpoint.uid,
+                            viewpoint,
+                            image.detach(),
+                            depth.detach(),
+                            opacity.detach(),
+                        )
+                    )
 
             for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
                 viewpoint = random_viewpoint_stack[cam_idx]
@@ -261,7 +461,22 @@ class BackEnd(mp.Process):
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             loss_mapping += 10 * isotropic_loss.mean()
+            if self.forgetting_reg_cfg.get("enabled", False) and not prune:
+                loss_mapping += self.gaussians.forgetting_regularization_loss(
+                    self.forgetting_reg_cfg
+                )
             loss_mapping.backward()
+            if self.forgetting_reg_cfg.get("enabled", False) and not prune:
+                update_every = max(
+                    1, int(self.forgetting_reg_cfg.get("update_every_kf", 1))
+                )
+                if self.iteration_count % update_every == 0:
+                    self.gaussians.update_forgetting_importance(
+                        visibility_filter_acm,
+                        normalize=self.forgetting_reg_cfg.get(
+                            "normalize_importance", True
+                        ),
+                    )
             gaussian_split = False
             ## Deinsifying / Pruning Gaussians
             with torch.no_grad():
@@ -328,6 +543,51 @@ class BackEnd(mp.Process):
                         self.gaussian_extent,
                         self.size_threshold,
                     )
+                    trigger_every = int(
+                        self.render_guided_cfg.get(
+                            "trigger_every", self.gaussian_update_every
+                        )
+                    )
+                    trigger_offset = int(
+                        self.render_guided_cfg.get(
+                            "trigger_offset", self.gaussian_update_offset
+                        )
+                    )
+                    run_render_guided = (
+                        render_guided_enabled
+                        and trigger_every > 0
+                        and self.iteration_count % trigger_every == trigger_offset
+                    )
+                    if run_render_guided:
+                        remaining_budget = int(
+                            self.render_guided_cfg.get(
+                                "max_new_points_per_update",
+                                self.render_guided_cfg.get(
+                                    "max_new_points_per_kf", 3000
+                                ),
+                            )
+                        )
+                        per_kf_limit = int(
+                            self.render_guided_cfg.get("max_new_points_per_kf", 3000)
+                        )
+                        for (
+                            frame_idx,
+                            viewpoint,
+                            image_rg,
+                            depth_rg,
+                            opacity_rg,
+                        ) in render_guided_candidates:
+                            if remaining_budget <= 0:
+                                break
+                            added = self.add_render_guided_gaussians(
+                                frame_idx,
+                                viewpoint,
+                                image_rg,
+                                depth_rg,
+                                opacity_rg,
+                                min(per_kf_limit, remaining_budget),
+                            )
+                            remaining_budget -= added
                     gaussian_split = True
 
                 ## Opacity reset
@@ -340,6 +600,8 @@ class BackEnd(mp.Process):
 
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+                if self.forgetting_reg_cfg.get("enabled", False):
+                    self.gaussians.capture_forgetting_snapshot()
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
@@ -416,7 +678,6 @@ class BackEnd(mp.Process):
         self.uncer_optimizer = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
     def run(self):
         while True:
             if self.backend_queue.empty():
