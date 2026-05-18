@@ -12,7 +12,11 @@ from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_tracking, get_median_depth
+from utils.slam_utils import (
+    get_loss_tracking,
+    get_median_depth,
+    log_uncertainty_debug_stats,
+)
 
 
 class FrontEnd(mp.Process):
@@ -43,6 +47,9 @@ class FrontEnd(mp.Process):
         self.device = "cuda:0"
         self.pause = False
         self.uncer_network = None
+        self.uncertainty_state_syncs = 0
+        self._logged_tracking_uncertainty_warmup = False
+        self._logged_tracking_uncertainty_enabled = False
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -54,6 +61,53 @@ class FrontEnd(mp.Process):
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
         self.single_thread = self.config["Training"]["single_thread"]
+        uncertainty_cfg = self.config.get("Training", {}).get("uncertainty", {})
+        self.tracking_uncertainty_warmup_keyframes = uncertainty_cfg.get(
+            "tracking_warmup_keyframes", 0
+        )
+        self.tracking_uncertainty_warmup_backend_syncs = uncertainty_cfg.get(
+            "tracking_warmup_backend_syncs", 0
+        )
+
+    def get_tracking_uncertainty_network(self):
+        uncertainty_cfg = self.config.get("Training", {}).get("uncertainty", {})
+        tracking_uncertainty_enabled = (
+            uncertainty_cfg.get("enabled", False)
+            and (
+                uncertainty_cfg.get("apply_to_tracking_rgb", True)
+                or uncertainty_cfg.get("apply_to_tracking_depth", False)
+            )
+            and self.uncer_network is not None
+        )
+        if not tracking_uncertainty_enabled:
+            return self.uncer_network
+
+        warmup_done = (
+            self.initialized
+            and len(self.kf_indices) >= self.tracking_uncertainty_warmup_keyframes
+            and self.uncertainty_state_syncs
+            >= self.tracking_uncertainty_warmup_backend_syncs
+        )
+        if not warmup_done:
+            if not self._logged_tracking_uncertainty_warmup:
+                print(
+                    "[Uncertainty] tracking warmup: "
+                    f"keyframes={len(self.kf_indices)}/"
+                    f"{self.tracking_uncertainty_warmup_keyframes}, "
+                    f"backend_syncs={self.uncertainty_state_syncs}/"
+                    f"{self.tracking_uncertainty_warmup_backend_syncs}"
+                )
+                self._logged_tracking_uncertainty_warmup = True
+            return None
+
+        if not self._logged_tracking_uncertainty_enabled:
+            print(
+                "[Uncertainty] tracking warmup done: "
+                f"keyframes={len(self.kf_indices)}, "
+                f"backend_syncs={self.uncertainty_state_syncs}"
+            )
+            self._logged_tracking_uncertainty_enabled = True
+        return self.uncer_network
 
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
@@ -177,7 +231,7 @@ class FrontEnd(mp.Process):
                 depth,
                 opacity,
                 viewpoint,
-                uncertainty_network=self.uncer_network,
+                uncertainty_network=self.get_tracking_uncertainty_network(),
             )
             loss_tracking.backward()
 
@@ -319,6 +373,8 @@ class FrontEnd(mp.Process):
                 {k: v.to(self.device) for k, v in uncer_state.items()}
             )
             self.uncer_network.eval()
+            if data[0] != "init":
+                self.uncertainty_state_syncs += 1
 
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()
@@ -369,6 +425,9 @@ class FrontEnd(mp.Process):
                         save_gaussians(
                             self.gaussians, self.save_dir, "final", final=True
                         )
+                    if hasattr(self.dataset, "log_feature_stats"):
+                        self.dataset.log_feature_stats(" (frontend)")
+                    log_uncertainty_debug_stats(" (frontend)")
                     break
 
                 if self.requested_init:

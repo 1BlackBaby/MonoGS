@@ -202,8 +202,17 @@ class BaseDataset(torch.utils.data.Dataset):
         self.use_uncertainty = uncertainty_cfg.get("enabled", False)
         self.feature_path = config.get("Dataset", {}).get("feature_path", "")
         self.feature_format = config.get("Dataset", {}).get("feature_format", "npy")
+        self.feature_suffix = uncertainty_cfg.get("feature_suffix", "")
+        self.extract_features_online = uncertainty_cfg.get(
+            "extract_features_online", False
+        )
+        self.feature_output_root = uncertainty_cfg.get("feature_output_root", "output")
         self._warned_missing_features = False
         self._warned_feature_fallbacks = set()
+        self.feature_stats = {"hit": 0, "missing": 0, "bad": 0}
+        self._logged_first_feature_hit = False
+        self._feature_extractor = None
+        self._feature_extractor_failed = False
 
     def __len__(self):
         return self.num_imgs
@@ -217,18 +226,105 @@ class BaseDataset(torch.utils.data.Dataset):
         print(f"[Warning] {message} Falling back to original MonoGS losses.")
         self._warned_feature_fallbacks.add(key)
 
-    def load_features(self, idx):
+    def log_feature_stats(self, tag=""):
+        if not self.use_uncertainty:
+            return
+        total = (
+            self.feature_stats["hit"]
+            + self.feature_stats["missing"]
+            + self.feature_stats["bad"]
+        )
+        print(
+            f"[Uncertainty] feature stats{tag}: "
+            f"hit={self.feature_stats['hit']}, "
+            f"missing={self.feature_stats['missing']}, "
+            f"bad={self.feature_stats['bad']}, total_checked={total}"
+        )
+
+    def get_feature_root(self):
+        if self.feature_path:
+            return self.feature_path
+        if self.extract_features_online:
+            scene = self.config.get("Dataset", {}).get("scene", "")
+            if not scene:
+                dataset_path = self.config["Dataset"].get("dataset_path", self.path)
+                scene = os.path.basename(os.path.normpath(dataset_path)) or "scene"
+            return os.path.join(
+                self.feature_output_root, scene, "mono_priors", "features"
+            )
+        dataset_path = self.config["Dataset"].get("dataset_path", self.path)
+        return os.path.join(dataset_path, "mono_priors", "features")
+
+    def get_online_feature_extractor(self):
+        if self._feature_extractor_failed:
+            return None
+        if self._feature_extractor is None:
+            try:
+                from utils.mono_priors.img_feature_extractors import (
+                    get_feature_extractor,
+                )
+
+                self._feature_extractor = get_feature_extractor(
+                    self.config, device=self.device
+                )
+                print("[Uncertainty] online feature extractor initialized")
+            except Exception as exc:
+                self._feature_extractor_failed = True
+                self.warn_feature_fallback(
+                    "feature_extractor_init",
+                    f"Unable to initialize online feature extractor: {exc}.",
+                )
+                return None
+        return self._feature_extractor
+
+    def extract_features_online_for_image(self, idx, image, feature_root):
+        if not self.extract_features_online or image is None:
+            return None
+        extractor = self.get_online_feature_extractor()
+        if extractor is None:
+            return None
+        try:
+            from utils.mono_priors.img_feature_extractors import predict_img_features
+
+            features = predict_img_features(
+                extractor,
+                idx,
+                image.unsqueeze(0),
+                self.config,
+                self.device,
+                feature_root,
+                save_feat=True,
+                suffix=self.feature_suffix,
+            )
+        except Exception as exc:
+            self.warn_feature_fallback(
+                "feature_extract",
+                f"Unable to extract online uncertainty features for frame {idx}: {exc}.",
+            )
+            return None
+        return features.detach().cpu().float()
+
+    def load_features(self, idx, image=None):
         if not self.use_uncertainty:
             return None
         if self.feature_format != "npy":
             raise ValueError(f"Unsupported feature_format: {self.feature_format}")
 
-        feature_root = self.feature_path
-        if not feature_root:
-            dataset_path = self.config["Dataset"].get("dataset_path", self.path)
-            feature_root = os.path.join(dataset_path, "mono_priors", "features")
-        feature_file = os.path.join(feature_root, f"{idx:05d}.npy")
+        feature_root = self.get_feature_root()
+        feature_file = os.path.join(feature_root, f"{idx:05d}{self.feature_suffix}.npy")
         if not os.path.isfile(feature_file):
+            features = self.extract_features_online_for_image(idx, image, feature_root)
+            if features is not None:
+                self.feature_stats["hit"] += 1
+                if not self._logged_first_feature_hit:
+                    print(
+                        f"[Uncertainty] first feature extracted: {feature_file}, "
+                        f"shape={tuple(features.shape)}"
+                    )
+                    self._logged_first_feature_hit = True
+                return features
+
+            self.feature_stats["missing"] += 1
             if not self._warned_missing_features:
                 print(
                     f"[Warning] Uncertainty enabled but feature file is missing: {feature_file}. "
@@ -240,6 +336,7 @@ class BaseDataset(torch.utils.data.Dataset):
         try:
             features = np.load(feature_file, allow_pickle=False)
         except (OSError, ValueError, RuntimeError) as exc:
+            self.feature_stats["bad"] += 1
             self.warn_feature_fallback(
                 "read_error",
                 f"Unable to load uncertainty feature file {feature_file}: {exc}.",
@@ -250,18 +347,21 @@ class BaseDataset(torch.utils.data.Dataset):
             "feature_dim", 384
         )
         if not isinstance(features, np.ndarray):
+            self.feature_stats["bad"] += 1
             self.warn_feature_fallback(
                 "not_array",
                 f"Uncertainty feature file {feature_file} did not contain an ndarray.",
             )
             return None
         if features.ndim != 3 or features.shape[0] <= 0 or features.shape[1] <= 0:
+            self.feature_stats["bad"] += 1
             self.warn_feature_fallback(
                 "bad_shape",
                 f"Uncertainty feature file {feature_file} has invalid shape {features.shape}; expected HxWxC.",
             )
             return None
         if features.shape[-1] != expected_dim:
+            self.feature_stats["bad"] += 1
             self.warn_feature_fallback(
                 "bad_feature_dim",
                 f"Uncertainty feature file {feature_file} has feature_dim={features.shape[-1]}, expected {expected_dim}.",
@@ -271,18 +371,27 @@ class BaseDataset(torch.utils.data.Dataset):
         try:
             features = features.astype(np.float32, copy=False)
         except (TypeError, ValueError) as exc:
+            self.feature_stats["bad"] += 1
             self.warn_feature_fallback(
                 "bad_dtype",
                 f"Uncertainty feature file {feature_file} cannot be converted to float32: {exc}.",
             )
             return None
         if not np.isfinite(features).all():
+            self.feature_stats["bad"] += 1
             self.warn_feature_fallback(
                 "non_finite",
                 f"Uncertainty feature file {feature_file} contains NaN or Inf values.",
             )
             return None
 
+        self.feature_stats["hit"] += 1
+        if not self._logged_first_feature_hit:
+            print(
+                f"[Uncertainty] first feature loaded: {feature_file}, "
+                f"shape={features.shape}"
+            )
+            self._logged_first_feature_hit = True
         return torch.from_numpy(features)
 
 
@@ -355,7 +464,7 @@ class MonocularDataset(BaseDataset):
             .to(device=self.device, dtype=self.dtype)
         )
         pose = torch.from_numpy(pose).to(device=self.device)
-        features = self.load_features(idx)
+        features = self.load_features(idx, image=image)
         if self.use_uncertainty:
             return image, depth, pose, features
         return image, depth, pose
@@ -473,7 +582,7 @@ class StereoDataset(BaseDataset):
         )
         pose = torch.from_numpy(pose).to(device=self.device)
 
-        features = self.load_features(idx)
+        features = self.load_features(idx, image=image)
         if self.use_uncertainty:
             return image, depth, pose, features
         return image, depth, pose
@@ -602,7 +711,7 @@ class RealsenseDataset(BaseDataset):
             .to(device=self.device, dtype=self.dtype)
         )
 
-        features = self.load_features(idx)
+        features = self.load_features(idx, image=image)
         if self.use_uncertainty:
             return image, depth, pose, features
         return image, depth, pose

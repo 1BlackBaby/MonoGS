@@ -4,6 +4,33 @@ import torch.nn.functional as F
 from utils.dyn_uncertainty import mapping_utils
 
 
+_uncertainty_debug_stats = {
+    "tracking_used": 0,
+    "tracking_fallback": 0,
+    "mapping_used": 0,
+    "mapping_fallback": 0,
+}
+
+
+def _record_uncertainty_debug(name):
+    _uncertainty_debug_stats[name] += 1
+    if _uncertainty_debug_stats[name] == 1:
+        print(f"[Uncertainty] {name.replace('_', ' ')}")
+
+
+def log_uncertainty_debug_stats(tag=""):
+    total = sum(_uncertainty_debug_stats.values())
+    if total == 0:
+        return
+    print(
+        f"[Uncertainty] loss stats{tag}: "
+        f"tracking_used={_uncertainty_debug_stats['tracking_used']}, "
+        f"tracking_fallback={_uncertainty_debug_stats['tracking_fallback']}, "
+        f"mapping_used={_uncertainty_debug_stats['mapping_used']}, "
+        f"mapping_fallback={_uncertainty_debug_stats['mapping_fallback']}"
+    )
+
+
 def image_gradient(image):
     # Compute image gradient using Scharr Filter
     c = image.shape[0]
@@ -159,7 +186,10 @@ def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint, uncertainty_
             uncertainty_network, viewpoint, (h, w), uncertainty_cfg, no_grad=True
         )
         if weights is not None:
+            _record_uncertainty_debug("tracking_used")
             l1 = l1 * weights.to(device=l1.device, dtype=l1.dtype)
+        else:
+            _record_uncertainty_debug("tracking_fallback")
     return l1.mean()
 
 
@@ -214,6 +244,7 @@ def get_loss_mapping(
         and has_uncertainty_features(viewpoint)
         and (not initialization or uncertainty_cfg.get("apply_during_init", True))
     ):
+        _record_uncertainty_debug("mapping_used")
         return get_loss_mapping_uncertainty(
             config,
             image,
@@ -224,6 +255,9 @@ def get_loss_mapping(
             initialization,
             regularization_viewpoints=regularization_viewpoints,
         )
+
+    if uncertainty_cfg.get("enabled", False) and uncertainty_network is not None:
+        _record_uncertainty_debug("mapping_fallback")
 
     if initialization:
         image_ab = image

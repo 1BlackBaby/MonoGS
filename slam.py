@@ -1,4 +1,5 @@
 import os
+import queue
 import sys
 import time
 from argparse import ArgumentParser
@@ -195,8 +196,24 @@ class SLAM:
             wandb.log({"Metrics": metrics_table})
             save_gaussians(self.gaussians, self.save_dir, "final_after_opt", final=True)
 
+        drained_frontend_msgs = 0
+        while True:
+            try:
+                frontend_queue.get_nowait()
+                drained_frontend_msgs += 1
+            except queue.Empty:
+                break
+        if drained_frontend_msgs > 0:
+            Log("Drained frontend queue messages before backend shutdown", drained_frontend_msgs)
+
+        Log("Sending stop signal to backend")
         backend_queue.put(["stop"])
-        backend_process.join()
+        Log("Waiting for backend process to join")
+        backend_process.join(timeout=30)
+        if backend_process.is_alive():
+            Log("Backend did not exit after 30s; terminating backend process")
+            backend_process.terminate()
+            backend_process.join(timeout=10)
         Log("Backend stopped and joined the main thread")
         if self.use_gui:
             q_main2vis.put(gui_utils.GaussianPacket(finish=True))

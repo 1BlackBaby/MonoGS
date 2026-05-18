@@ -10,7 +10,7 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_mapping
+from utils.slam_utils import get_loss_mapping, log_uncertainty_debug_stats
 
 
 class BackEnd(mp.Process):
@@ -406,6 +406,17 @@ class BackEnd(mp.Process):
         msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes, uncer_state]
         self.frontend_queue.put(msg)
 
+    def release_resources(self):
+        self.gaussians = None
+        self.viewpoints = {}
+        self.occ_aware_visibility = {}
+        self.current_window = []
+        self.keyframe_optimizers = None
+        self.uncer_network = None
+        self.uncer_optimizer = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def run(self):
         while True:
             if self.backend_queue.empty():
@@ -426,6 +437,8 @@ class BackEnd(mp.Process):
             else:
                 data = self.backend_queue.get()
                 if data[0] == "stop":
+                    log_uncertainty_debug_stats(" (backend)")
+                    self.release_resources()
                     break
                 elif data[0] == "pause":
                     self.pause = True
@@ -519,6 +532,4 @@ class BackEnd(mp.Process):
                     raise Exception("Unprocessed data", data)
         while not self.backend_queue.empty():
             self.backend_queue.get()
-        while not self.frontend_queue.empty():
-            self.frontend_queue.get()
         return

@@ -3,8 +3,8 @@ Results:
   save_dir: "results"
   save_trj: True
   save_trj_kf_intv: 10
-  use_gui: True
-  eval_rendering: False
+  use_gui: False
+  eval_rendering: True
   use_wandb: False
 
 Dataset:
@@ -16,6 +16,7 @@ Dataset:
   pcd_downsample_init: 32
   adaptive_pointsize: True
   point_size: 0.01
+  single_thread: True
 
 Training:
   init_itr_num: 1050
@@ -44,10 +45,15 @@ Training:
   prune_mode: 'slam'
   single_thread: True
   spherical_harmonics: False
+
   uncertainty:
-    enabled: False
+    enabled: True
     feature_dim: 384
     feature_type: "dino"
+    extract_features_online: True
+    feature_extractor: "dinov2_reg_small_fine"
+    feature_output_root: "output"
+    feature_suffix: ""
     min_uncertainty: 0.1
     eps: 0.001
     min_weight_threshold: 0.1
@@ -64,9 +70,11 @@ Training:
     weight_decay: 0.00001
     apply_to_tracking_rgb: True
     apply_to_tracking_depth: False
+    tracking_warmup_keyframes: 25
+    tracking_warmup_backend_syncs: 1
     apply_to_mapping_rgb: True
     apply_to_mapping_depth: True
-    apply_during_init: True
+    apply_during_init: False
 
   lr:
     cam_rot_delta: 0.003
@@ -101,3 +109,6 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
+
+mono_prior:
+  feature_extractor: "dinov2_reg_small_fine"

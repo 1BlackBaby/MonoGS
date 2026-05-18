@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 
@@ -22,11 +23,22 @@ from gaussian_splatting.utils.system_utils import mkdir_p
 from utils.logging_utils import Log
 
 
+def _align_trajectory(traj_est, traj_ref, correct_scale=False):
+    if hasattr(trajectory, "align_trajectory"):
+        return trajectory.align_trajectory(
+            traj_est, traj_ref, correct_scale=correct_scale
+        )
+
+    traj_est_aligned = copy.deepcopy(traj_est)
+    traj_est_aligned.align(traj_ref, correct_scale=correct_scale)
+    return traj_est_aligned
+
+
 def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     ## Plot
     traj_ref = PosePath3D(poses_se3=poses_gt)
     traj_est = PosePath3D(poses_se3=poses_est)
-    traj_est_aligned = trajectory.align_trajectory(
+    traj_est_aligned = _align_trajectory(
         traj_est, traj_ref, correct_scale=monocular
     )
 
@@ -135,7 +147,7 @@ def eval_rendering(
             continue
         saved_frame_idx.append(idx)
         frame = frames[idx]
-        gt_image, _, _ = dataset[idx]
+        gt_image = dataset[idx][0]
 
         rendering = render(frame, gaussians, pipe, background)["render"]
         image = torch.clamp(rendering, 0.0, 1.0)
