@@ -67,6 +67,11 @@ class BackEnd(mp.Process):
                 raise ValueError(
                     f"Training.render_guided_densification.{key} must be an integer >= 1"
                 )
+        pcd_downsample = cfg.get("pcd_downsample", 4)
+        if not isinstance(pcd_downsample, int) or pcd_downsample < 1:
+            raise ValueError(
+                "Training.render_guided_densification.pcd_downsample must be an integer >= 1"
+            )
         trigger_offset = cfg.get("trigger_offset")
         if not isinstance(trigger_offset, int) or trigger_offset < 0:
             raise ValueError(
@@ -163,24 +168,35 @@ class BackEnd(mp.Process):
 
             densify_mask = torch.zeros_like(opacity_map, dtype=torch.bool)
             score_map = torch.zeros_like(opacity_map, dtype=rgb_error_map.dtype)
+            opacity_candidates = 0
+            rgb_candidates = 0
+            depth_candidates = 0
             if cfg.get("use_opacity_hole", True):
                 opacity_score = torch.clamp(
                     cfg.get("opacity_threshold", 0.5) - opacity_map, min=0.0
                 )
+                opacity_candidate_mask = opacity_map < cfg.get(
+                    "opacity_threshold", 0.5
+                )
                 densify_mask = torch.logical_or(
                     densify_mask,
-                    opacity_map < cfg.get("opacity_threshold", 0.5),
+                    opacity_candidate_mask,
                 )
                 score_map = score_map + opacity_score
+                opacity_candidates = int(opacity_candidate_mask.count_nonzero().item())
             if cfg.get("use_rgb_error", True):
                 rgb_score = torch.clamp(
                     rgb_error_map - cfg.get("rgb_error_threshold", 0.25), min=0.0
                 )
+                rgb_candidate_mask = rgb_error_map > cfg.get(
+                    "rgb_error_threshold", 0.25
+                )
                 densify_mask = torch.logical_or(
                     densify_mask,
-                    rgb_error_map > cfg.get("rgb_error_threshold", 0.25),
+                    rgb_candidate_mask,
                 )
                 score_map = score_map + rgb_score
+                rgb_candidates = int(rgb_candidate_mask.count_nonzero().item())
 
             if cfg.get("use_depth_error", False) and viewpoint.depth is not None:
                 gt_depth_for_error = torch.from_numpy(viewpoint.depth).to(
@@ -194,14 +210,20 @@ class BackEnd(mp.Process):
                     - cfg.get("depth_error_ratio_threshold", 0.1),
                     min=0.0,
                 )
+                depth_candidate_mask = depth_diff_ratio > cfg.get(
+                    "depth_error_ratio_threshold", 0.1
+                )
                 densify_mask = torch.logical_or(
                     densify_mask,
-                    depth_diff_ratio > cfg.get("depth_error_ratio_threshold", 0.1),
+                    depth_candidate_mask,
                 )
                 score_map = score_map + depth_score
+                depth_candidates = int(depth_candidate_mask.count_nonzero().item())
 
             rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
             valid_rgb = gt_image.sum(dim=0) > rgb_boundary_threshold
+            candidate_before_valid = int(densify_mask.count_nonzero().item())
+            valid_rgb_count = int(valid_rgb.count_nonzero().item())
             densify_mask = torch.logical_and(densify_mask, valid_rgb)
 
             if viewpoint.depth is not None:
@@ -211,7 +233,10 @@ class BackEnd(mp.Process):
             else:
                 depth_source = depth.squeeze().detach()
             min_depth = cfg.get("min_depth", 0.01)
-            densify_mask = torch.logical_and(densify_mask, depth_source > min_depth)
+            valid_depth = depth_source > min_depth
+            valid_depth_count = int(valid_depth.count_nonzero().item())
+            densify_mask = torch.logical_and(densify_mask, valid_depth)
+            selected_after_valid = int(densify_mask.count_nonzero().item())
 
             downsample = max(1, int(cfg.get("downsample", 1)))
             if downsample > 1:
@@ -227,7 +252,17 @@ class BackEnd(mp.Process):
                 densify_mask = torch.logical_and(densify_mask, sample_mask)
 
             selected_count = int(densify_mask.count_nonzero().item())
+            selected_before_budget = selected_count
             if selected_count == 0:
+                Log(
+                    "Render-guided diagnostics "
+                    f"kf={frame_idx}: opacity={opacity_candidates}, "
+                    f"rgb={rgb_candidates}, depth={depth_candidates}, "
+                    f"candidate={candidate_before_valid}, "
+                    f"valid_rgb={valid_rgb_count}, valid_depth={valid_depth_count}, "
+                    f"after_valid={selected_after_valid}, "
+                    f"after_pixel_downsample={selected_count}, added=0"
+                )
                 return 0
 
             if max_new_points > 0 and selected_count > max_new_points:
@@ -244,11 +279,13 @@ class BackEnd(mp.Process):
                 limited_mask = torch.zeros_like(densify_mask.flatten(), dtype=torch.bool)
                 limited_mask[candidate_idx[topk]] = True
                 densify_mask = limited_mask.view_as(densify_mask)
+                selected_count = int(densify_mask.count_nonzero().item())
 
             mask_np = densify_mask.detach().cpu().numpy().astype(bool)
             depth_np = depth_source.detach().cpu().numpy().astype("float32")
 
-        added = self.gaussians.extend_from_pcd_seq(
+        pcd_downsample = max(1, int(cfg.get("pcd_downsample", 4)))
+        added, point_count = self.gaussians.extend_from_pcd_seq(
             viewpoint,
             kf_id=frame_idx,
             init=False,
@@ -259,6 +296,21 @@ class BackEnd(mp.Process):
                 "initial_opacity", max(0.5, float(self.gaussian_th) + 0.05)
             ),
             use_valid_depth_median=True,
+            pcd_downsample_factor=pcd_downsample,
+            return_point_count=True,
+        )
+        Log(
+            "Render-guided diagnostics "
+            f"kf={frame_idx}: opacity={opacity_candidates}, "
+            f"rgb={rgb_candidates}, depth={depth_candidates}, "
+            f"candidate={candidate_before_valid}, "
+            f"valid_rgb={valid_rgb_count}, valid_depth={valid_depth_count}, "
+            f"after_valid={selected_after_valid}, "
+            f"after_pixel_downsample={selected_before_budget}, "
+            f"after_budget={selected_count}, "
+            f"pcd_downsample={pcd_downsample}, "
+            f"pcd_before={point_count['pcd_before_downsample']}, "
+            f"pcd_after={point_count['pcd_after_downsample']}, added={added}"
         )
         if added > 0:
             Log("Render-guided densification added", added, "Gaussians")

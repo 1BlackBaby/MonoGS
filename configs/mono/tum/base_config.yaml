@@ -90,6 +90,7 @@ Training:
     trigger_every: 150
     trigger_offset: 50
     downsample: 1
+    pcd_downsample: 4
     initial_opacity: 0.8
 
   forgetting_regularization:

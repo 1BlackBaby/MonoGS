@@ -122,6 +122,8 @@ class GaussianModel:
         mask=None,
         opacity_value=0.5,
         use_valid_depth_median=False,
+        pcd_downsample_factor=None,
+        return_point_count=False,
     ):
         cam = cam_info
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
@@ -160,6 +162,8 @@ class GaussianModel:
             init,
             opacity_value=opacity_value,
             use_valid_depth_median=use_valid_depth_median,
+            pcd_downsample_factor=pcd_downsample_factor,
+            return_point_count=return_point_count,
         )
 
     def create_pcd_from_image_and_depth(
@@ -170,8 +174,12 @@ class GaussianModel:
         init=False,
         opacity_value=0.5,
         use_valid_depth_median=False,
+        pcd_downsample_factor=None,
+        return_point_count=False,
     ):
-        if init:
+        if pcd_downsample_factor is not None:
+            downsample_factor = pcd_downsample_factor
+        elif init:
             downsample_factor = self.config["Dataset"]["pcd_downsample_init"]
         else:
             downsample_factor = self.config["Dataset"]["pcd_downsample"]
@@ -207,9 +215,14 @@ class GaussianModel:
             extrinsic=W2C,
             project_valid_depth_only=True,
         )
+        pcd_count_before_downsample = len(pcd_tmp.points)
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
+        point_count = {
+            "pcd_before_downsample": pcd_count_before_downsample,
+            "pcd_after_downsample": new_xyz.shape[0],
+        }
 
         if new_xyz.shape[0] == 0:
             empty_xyz = torch.empty(0, 3, device="cuda")
@@ -221,13 +234,16 @@ class GaussianModel:
                 empty_scaling = torch.empty(0, 1, device="cuda")
             empty_rotation = torch.empty(0, 4, device="cuda")
             empty_opacity = torch.empty(0, 1, device="cuda")
-            return (
+            result = (
                 empty_xyz,
                 empty_features,
                 empty_scaling,
                 empty_rotation,
                 empty_opacity,
             )
+            if return_point_count:
+                return result, point_count
+            return result
 
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
@@ -265,7 +281,10 @@ class GaussianModel:
             )
         )
 
-        return fused_point_cloud, features, scales, rots, opacities
+        result = (fused_point_cloud, features, scales, rots, opacities)
+        if return_point_count:
+            return result, point_count
+        return result
 
     def init_lr(self, spatial_lr_scale):
         self.spatial_lr_scale = spatial_lr_scale
@@ -320,19 +339,24 @@ class GaussianModel:
         reset_densification_stats=True,
         opacity_value=0.5,
         use_valid_depth_median=False,
+        pcd_downsample_factor=None,
+        return_point_count=False,
     ):
-        fused_point_cloud, features, scales, rots, opacities = (
-            self.create_pcd_from_image(
-                cam_info,
-                init,
-                scale=scale,
-                depthmap=depthmap,
-                mask=mask,
-                opacity_value=opacity_value,
-                use_valid_depth_median=use_valid_depth_median,
-            )
+        pcd_result = self.create_pcd_from_image(
+            cam_info,
+            init,
+            scale=scale,
+            depthmap=depthmap,
+            mask=mask,
+            opacity_value=opacity_value,
+            use_valid_depth_median=use_valid_depth_median,
+            pcd_downsample_factor=pcd_downsample_factor,
+            return_point_count=return_point_count,
         )
-        return self.extend_from_pcd(
+        if return_point_count:
+            pcd_result, point_count = pcd_result
+        fused_point_cloud, features, scales, rots, opacities = pcd_result
+        added = self.extend_from_pcd(
             fused_point_cloud,
             features,
             scales,
@@ -341,6 +365,9 @@ class GaussianModel:
             kf_id,
             reset_densification_stats=reset_densification_stats,
         )
+        if return_point_count:
+            return added, point_count
+        return added
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense

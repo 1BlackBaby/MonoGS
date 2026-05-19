@@ -125,3 +125,152 @@ git diff --check
 4. 正则强度风险：`lambda_color` / `lambda_scaling` 过大可能压制当前帧收敛，需要从较小值开始做消融。
 5. 运行时风险：虽然已对 visibility shape mismatch 做 warning 并跳过 importance 更新，但完整 prune / densify / sync 流程仍需长序列验证。
 6. 配置兼容风险：如果用户启用 render-guided 或 forgetting 但配置字段非法，后端会在 `set_hyperparams()` 阶段抛 `ValueError`，这是有意的早失败行为。
+
+---
+
+## 5. 本轮运行问题修复总结（2026-05-19）
+
+### 5.1 ATE 评估阶段 `SVD did not converge`
+
+运行过程中在 `evo` 轨迹对齐阶段出现：
+
+```text
+numpy.linalg.LinAlgError: SVD did not converge
+```
+
+该问题发生在 ATE 评估流程，而不是 tracking、mapping 或 uncertainty 模块本身。直接原因是传入 `evo` 的关键帧轨迹中存在非法位姿，常见形式包括：
+
+- 位姿矩阵中包含 `NaN` 或 `Inf`；
+- 有效位姿数量不足；
+- 轨迹没有有效平移运动，导致 Umeyama 对齐退化。
+
+已在 `utils/eval_utils.py` 中做了防护：
+
+- 新增 `_is_valid_pose(...)`，过滤非 4x4 或含 `NaN/Inf` 的位姿矩阵；
+- 新增 `_has_nonzero_motion(...)`，避免对退化轨迹继续做 `evo` 对齐；
+- `eval_ate(...)` 在无关键帧时直接跳过；
+- 对非法关键帧位姿做跳过处理，并记录 `skipped_invalid_ids`；
+- `evaluate_evo(...)` 捕获 `np.linalg.LinAlgError` 和 `ValueError`，输出清晰日志并返回 `nan`，避免主流程崩溃；
+- 修复原有日志字符串 `RMSE ATE \[m]` 的 Python 转义警告。
+
+修复后的行为是：ATE 评估不会因为少量异常关键帧直接中断 SLAM 流程，但日志会提示被跳过的关键帧 id。例如：
+
+```text
+Eval: Skipped 3 invalid pose pair(s) for ATE; first ids: [504, 509, 514]
+```
+
+这类日志说明评估阶段已安全跳过异常位姿，但也提示前面的 tracking 或 backend BA 可能已经在对应帧附近出现不稳定，需要进一步排查。
+
+### 5.2 建图效果差的初步判断
+
+本轮日志中出现：
+
+```text
+Render-guided densification added 14 Gaussians
+Render-guided densification added 6 Gaussians
+Render-guided densification added 5 Gaussians
+```
+
+同时最终渲染指标较低：
+
+```text
+mean psnr: 17.98, ssim: 0.60, lpips: 0.45
+```
+
+初步判断主要问题不是 uncertainty 模块，因为当前配置中：
+
+```yaml
+Training:
+  uncertainty:
+    enabled: False
+```
+
+更可疑的是 `render_guided_densification` 实际补点数量太少。原逻辑中 render-guided 补点最终复用 `GaussianModel.extend_from_pcd_seq(...)`，而该路径默认使用：
+
+```yaml
+Dataset:
+  pcd_downsample: 64
+```
+
+这会导致即使误差 mask 选出了较多候选像素，Open3D 点云生成后仍被随机下采样到约 `1/64`，最终新增高斯数量可能只剩个位数或十几个，难以改善地图结构。
+
+### 5.3 Render-guided 诊断日志与独立下采样参数
+
+按照“先做诊断日志和独立 `pcd_downsample`，不重构不相关代码”的原则，已做以下小范围修改。
+
+#### `utils/slam_backend.py`
+
+- 在 `_load_render_guided_config()` 中增加 `Training.render_guided_densification.pcd_downsample` 校验；
+- 该字段缺省为 `4`，避免破坏已有未显式配置该字段的配置文件；
+- 在 `add_render_guided_gaussians(...)` 中增加诊断日志，统计：
+  - opacity hole 候选像素数；
+  - RGB error 候选像素数；
+  - depth error 候选像素数；
+  - RGB/depth 有效区域过滤后的候选数量；
+  - pixel downsample 后数量；
+  - budget 限制后数量；
+  - Open3D 点云下采样前后点数；
+  - 最终新增 Gaussians 数。
+
+诊断日志格式示例：
+
+```text
+Render-guided diagnostics kf=504: opacity=..., rgb=..., depth=..., candidate=..., valid_rgb=..., valid_depth=..., after_valid=..., after_pixel_downsample=..., after_budget=..., pcd_downsample=4, pcd_before=..., pcd_after=..., added=...
+```
+
+#### `gaussian_splatting/scene/gaussian_model.py`
+
+只扩展现有函数参数，默认行为保持不变：
+
+- `create_pcd_from_image(...)` 增加可选参数：
+  - `pcd_downsample_factor`
+  - `return_point_count`
+- `create_pcd_from_image_and_depth(...)` 增加同名可选参数；
+- `extend_from_pcd_seq(...)` 增加同名可选参数；
+- 未传入 `pcd_downsample_factor` 时，仍按原逻辑使用：
+  - 初始化帧：`Dataset.pcd_downsample_init`
+  - 普通关键帧：`Dataset.pcd_downsample`
+- 仅 render-guided 补点路径会显式传入独立的 `pcd_downsample_factor`。
+
+#### `configs/mono/tum/base_config.yaml`
+
+在 `render_guided_densification` 配置块中新增：
+
+```yaml
+pcd_downsample: 4
+```
+
+当前 TUM 单目实验中 `render_guided_densification.enabled: True` 是已有工作区修改；本轮新增的是独立补点下采样参数和诊断日志。
+
+### 5.4 已验证内容
+
+已完成 Python 语法检查：
+
+```powershell
+python -m py_compile utils\eval_utils.py
+python -m py_compile utils\slam_backend.py gaussian_splatting\scene\gaussian_model.py
+```
+
+检查结果通过。
+
+### 5.5 后续建议
+
+下一次运行时重点观察诊断日志中的几个字段：
+
+- 如果 `candidate` 很大但 `pcd_after` 很小，说明点云下采样仍然过强；
+- 如果 `candidate` 本身很小，说明 `opacity_threshold` 或 `rgb_error_threshold` 太严格；
+- 如果 `after_valid` 明显变小，说明 RGB/depth 有效区域过滤过强；
+- 如果 `added` 增多后又出现 invalid pose，说明补点可能引入了错误几何，需要降低 `max_new_points_per_update` 或提高误差阈值。
+
+建议先以如下配置作为保守起点继续实验：
+
+```yaml
+render_guided_densification:
+  enabled: True
+  downsample: 1
+  pcd_downsample: 4
+  rgb_error_threshold: 0.25
+  opacity_threshold: 0.5
+  max_new_points_per_update: 3000
+  max_new_points_per_kf: 3000
+```

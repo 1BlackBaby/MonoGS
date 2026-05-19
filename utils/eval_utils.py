@@ -23,6 +23,19 @@ from gaussian_splatting.utils.system_utils import mkdir_p
 from utils.logging_utils import Log
 
 
+def _is_valid_pose(pose):
+    pose = np.asarray(pose)
+    return pose.shape == (4, 4) and np.isfinite(pose).all()
+
+
+def _has_nonzero_motion(poses):
+    if len(poses) < 2:
+        return False
+
+    positions = np.stack([np.asarray(pose)[:3, 3] for pose in poses])
+    return np.linalg.norm(positions - positions[0], axis=1).max() > 1e-8
+
+
 def _align_trajectory(traj_est, traj_ref, correct_scale=False):
     if hasattr(trajectory, "align_trajectory"):
         return trajectory.align_trajectory(
@@ -35,12 +48,24 @@ def _align_trajectory(traj_est, traj_ref, correct_scale=False):
 
 
 def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
+    if len(poses_gt) < 2:
+        Log("Skipping ATE: fewer than 2 valid pose pairs.", tag="Eval")
+        return float("nan")
+
+    if not _has_nonzero_motion(poses_gt) or not _has_nonzero_motion(poses_est):
+        Log("Skipping ATE: trajectory has no valid translational motion.", tag="Eval")
+        return float("nan")
+
     ## Plot
     traj_ref = PosePath3D(poses_se3=poses_gt)
     traj_est = PosePath3D(poses_se3=poses_est)
-    traj_est_aligned = _align_trajectory(
-        traj_est, traj_ref, correct_scale=monocular
-    )
+    try:
+        traj_est_aligned = _align_trajectory(
+            traj_est, traj_ref, correct_scale=monocular
+        )
+    except (np.linalg.LinAlgError, ValueError) as exc:
+        Log(f"Skipping ATE: evo trajectory alignment failed ({exc}).", tag="Eval")
+        return float("nan")
 
     ## RMSE
     pose_relation = metrics.PoseRelation.translation_part
@@ -49,7 +74,7 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     ape_metric.process_data(data)
     ape_stat = ape_metric.get_statistic(metrics.StatisticsType.rmse)
     ape_stats = ape_metric.get_all_statistics()
-    Log("RMSE ATE \[m]", ape_stat, tag="Eval")
+    Log("RMSE ATE \\[m]", ape_stat, tag="Eval")
 
     with open(
         os.path.join(plot_dir, "stats_{}.json".format(str(label))),
@@ -78,10 +103,15 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
 
 
 def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False):
+    if len(kf_ids) == 0:
+        Log("Skipping ATE: no keyframes.", tag="Eval")
+        return float("nan")
+
     trj_data = dict()
     latest_frame_idx = kf_ids[-1] + 2 if final else kf_ids[-1] + 1
     trj_id, trj_est, trj_gt = [], [], []
     trj_est_np, trj_gt_np = [], []
+    skipped_ids = []
 
     def gen_pose_matrix(R, T):
         pose = np.eye(4)
@@ -94,6 +124,10 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False)
         pose_est = np.linalg.inv(gen_pose_matrix(kf.R, kf.T))
         pose_gt = np.linalg.inv(gen_pose_matrix(kf.R_gt, kf.T_gt))
 
+        if not _is_valid_pose(pose_est) or not _is_valid_pose(pose_gt):
+            skipped_ids.append(frames[kf_id].uid)
+            continue
+
         trj_id.append(frames[kf_id].uid)
         trj_est.append(pose_est.tolist())
         trj_gt.append(pose_gt.tolist())
@@ -104,6 +138,14 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False)
     trj_data["trj_id"] = trj_id
     trj_data["trj_est"] = trj_est
     trj_data["trj_gt"] = trj_gt
+    if skipped_ids:
+        Log(
+            "Skipped {} invalid pose pair(s) for ATE; first ids: {}".format(
+                len(skipped_ids), skipped_ids[:5]
+            ),
+            tag="Eval",
+        )
+        trj_data["skipped_invalid_ids"] = skipped_ids
 
     plot_dir = os.path.join(save_dir, "plot")
     mkdir_p(plot_dir)
