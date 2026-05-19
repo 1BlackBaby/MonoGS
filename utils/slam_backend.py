@@ -10,7 +10,16 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_mapping, log_uncertainty_debug_stats
+from utils.mono_priors.gaustar_stage1 import (
+    gaustar_stage1_enabled,
+    get_gaustar_stage1_config,
+)
+from utils.slam_utils import (
+    build_rendered_depth_consistency_mask,
+    get_loss_mapping,
+    get_metric_depth_for_initialization,
+    log_uncertainty_debug_stats,
+)
 
 
 class BackEnd(mp.Process):
@@ -138,6 +147,7 @@ class BackEnd(mp.Process):
             else False
         )
         self.uncertainty_cfg = self.config.get("Training", {}).get("uncertainty", {})
+        self.gaustar_stage1_cfg = get_gaustar_stage1_config(self.config)
         self.render_guided_cfg = self._load_render_guided_config()
         self.forgetting_reg_cfg = self._load_forgetting_regularization_config()
         if self.uncertainty_cfg.get("enabled", False) and self.uncer_network is not None:
@@ -226,10 +236,26 @@ class BackEnd(mp.Process):
             valid_rgb_count = int(valid_rgb.count_nonzero().item())
             densify_mask = torch.logical_and(densify_mask, valid_rgb)
 
+            metric_depth_source = None
+            if (
+                gaustar_stage1_enabled(self.config)
+                and self.gaustar_stage1_cfg.get("use_metric3d_depth", True)
+                and viewpoint.depth is None
+            ):
+                metric_depth_source = get_metric_depth_for_initialization(
+                    self.config,
+                    viewpoint,
+                    depth=depth,
+                    opacity=opacity,
+                    mask=valid_rgb[None],
+                )
+
             if viewpoint.depth is not None:
                 depth_source = torch.from_numpy(viewpoint.depth).to(
                     dtype=torch.float32, device=image.device
                 )
+            elif metric_depth_source is not None:
+                depth_source = metric_depth_source.squeeze().detach()
             else:
                 depth_source = depth.squeeze().detach()
             min_depth = cfg.get("min_depth", 0.01)
@@ -237,6 +263,21 @@ class BackEnd(mp.Process):
             valid_depth_count = int(valid_depth.count_nonzero().item())
             densify_mask = torch.logical_and(densify_mask, valid_depth)
             selected_after_valid = int(densify_mask.count_nonzero().item())
+
+            if (
+                gaustar_stage1_enabled(self.config)
+                and self.gaustar_stage1_cfg.get("use_rendered_depth_filter", True)
+                and self.gaustar_stage1_cfg.get(
+                    "apply_filter_to_render_guided_densification", True
+                )
+            ):
+                consistency_mask = build_rendered_depth_consistency_mask(
+                    self.config, depth, opacity, viewpoint
+                )
+                if consistency_mask is not None:
+                    densify_mask = torch.logical_and(
+                        densify_mask, consistency_mask.squeeze()
+                    )
 
             downsample = max(1, int(cfg.get("downsample", 1)))
             if downsample > 1:

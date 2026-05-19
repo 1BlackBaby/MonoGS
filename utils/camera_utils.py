@@ -22,6 +22,7 @@ class Camera(nn.Module):
         image_height,
         image_width,
         features=None,
+        priors=None,
         device="cuda:0",
     ):
         super(Camera, self).__init__()
@@ -37,6 +38,7 @@ class Camera(nn.Module):
         self.original_image = color
         self.depth = depth
         self.features = features
+        self.priors = priors or {}
         self.grad_mask = None
 
         self.fx = fx
@@ -67,6 +69,12 @@ class Camera(nn.Module):
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
         data = dataset[idx]
+        priors = None
+        if len(data) > 3 and isinstance(data[-1], dict) and data[-1].get(
+            "gaustar_stage1", False
+        ):
+            priors = data[-1]
+            data = data[:-1]
         if len(data) == 4:
             gt_color, gt_depth, gt_pose, features = data
         else:
@@ -87,6 +95,7 @@ class Camera(nn.Module):
             dataset.height,
             dataset.width,
             features=features,
+            priors=priors,
             device=dataset.device,
         )
 
@@ -154,6 +163,7 @@ class Camera(nn.Module):
         self.original_image = None
         self.depth = None
         self.features = None
+        self.priors = {}
         self.grad_mask = None
 
         self.cam_rot_delta = None

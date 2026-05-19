@@ -13,6 +13,11 @@ Dataset:
   sensor_type: 'stereo'
   feature_path: ""
   feature_format: "npy"
+  mono_prior_path: ""
+  metric3d_depth_path: ""
+  flow_path: ""
+  prior_mask_path: ""
+  prior_format: "npy"
   pcd_downsample: 128
   pcd_downsample_init: 32
   adaptive_pointsize: False
@@ -48,6 +53,25 @@ Training:
   prune_mode: 'slam'
   single_thread: False
   spherical_harmonics: False
+  gaustar_stage1:
+    enabled: False
+    use_metric3d_depth: True
+    use_flow_pose_init: True
+    use_rendered_depth_filter: True
+    depth_scale_align: "median"
+    depth_consistency_threshold: 0.12
+    flow_fb_pixel_threshold: 3.0
+    flow_depth_fb_threshold: 0.05
+    depth_edge_kernel: 7
+    depth_edge_threshold: 0.1
+    min_pose_correspondences: 200
+    min_pose_inliers: 80
+    max_pose_reproj_error: 4.0
+    max_pose_correspondences: 5000
+    tracking_filter_min_ratio: 0.05
+    apply_filter_to_tracking: True
+    apply_filter_to_keyframe_depth: True
+    apply_filter_to_render_guided_densification: True
   uncertainty:
     enabled: False
     feature_dim: 384

@@ -9,6 +9,12 @@ import trimesh
 from PIL import Image
 
 from gaussian_splatting.utils.graphics_utils import focal2fov
+from utils.mono_priors.gaustar_stage1 import (
+    gaustar_stage1_enabled,
+    load_flow_file,
+    load_metric_depth_file,
+    load_prior_mask_file,
+)
 
 try:
     import pyrealsense2 as rs
@@ -213,6 +219,15 @@ class BaseDataset(torch.utils.data.Dataset):
         self._logged_first_feature_hit = False
         self._feature_extractor = None
         self._feature_extractor_failed = False
+        self.use_gaustar_stage1 = gaustar_stage1_enabled(config)
+        dataset_cfg = config.get("Dataset", {})
+        self.mono_prior_path = dataset_cfg.get("mono_prior_path", "")
+        self.metric3d_depth_path = dataset_cfg.get("metric3d_depth_path", "")
+        self.flow_path = dataset_cfg.get("flow_path", "")
+        self.prior_mask_path = dataset_cfg.get("prior_mask_path", "")
+        self.prior_format = dataset_cfg.get("prior_format", "npy")
+        self._warned_gaustar_fallbacks = set()
+        self.gaustar_prior_stats = {"metric_depth": 0, "flow": 0, "mask": 0}
 
     def __len__(self):
         return self.num_imgs
@@ -240,6 +255,151 @@ class BaseDataset(torch.utils.data.Dataset):
             f"missing={self.feature_stats['missing']}, "
             f"bad={self.feature_stats['bad']}, total_checked={total}"
         )
+
+    def warn_gaustar_fallback(self, key, message):
+        if key in self._warned_gaustar_fallbacks:
+            return
+        print(f"[GauSTAR Stage1] {message} Falling back to original MonoGS behavior.")
+        self._warned_gaustar_fallbacks.add(key)
+
+    def get_mono_prior_root(self):
+        if self.mono_prior_path:
+            return self.mono_prior_path
+        dataset_path = self.config["Dataset"].get("dataset_path", self.path)
+        return os.path.join(dataset_path, "mono_priors")
+
+    def _prior_file(self, root, names):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                return path
+        return os.path.join(root, names[0])
+
+    def load_metric_depth(self, idx, target_shape):
+        if not self.use_gaustar_stage1:
+            return None
+        if self.metric3d_depth_path:
+            roots = [self.metric3d_depth_path]
+        else:
+            mono_prior_root = self.get_mono_prior_root()
+            roots = [
+                os.path.join(mono_prior_root, "metric3d_depth"),
+                os.path.join(mono_prior_root, "depths"),
+            ]
+        names = [
+            f"{idx:05d}.{self.prior_format}",
+            f"{idx:06d}.{self.prior_format}",
+            f"{idx}.{self.prior_format}",
+        ]
+        depth_file = None
+        for root in roots:
+            candidate = self._prior_file(root, names)
+            if os.path.isfile(candidate):
+                depth_file = candidate
+                break
+        if depth_file is None:
+            depth_file = self._prior_file(roots[0], names)
+        if not os.path.isfile(depth_file):
+            self.warn_gaustar_fallback(
+                "metric_depth_missing",
+                f"Metric3D depth file is missing. Checked roots: {roots}.",
+            )
+            return None
+        try:
+            depth = load_metric_depth_file(depth_file, target_shape=target_shape)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.warn_gaustar_fallback(
+                "metric_depth_bad",
+                f"Unable to load Metric3D depth file {depth_file}: {exc}.",
+            )
+            return None
+        self.gaustar_prior_stats["metric_depth"] += 1
+        return torch.from_numpy(depth)
+
+    def load_flow_pair(self, idx, target_shape):
+        if not self.use_gaustar_stage1 or idx <= 0:
+            return None, None
+        root = self.flow_path or os.path.join(self.get_mono_prior_root(), "flow_bi")
+        prev_idx = idx - 1
+        flow_f_file = self._prior_file(
+            root,
+            [
+                f"{prev_idx:05d}_f.npz",
+                f"{prev_idx:06d}_f.npz",
+                f"{prev_idx}_f.npz",
+                f"{prev_idx:05d}_f.npy",
+            ],
+        )
+        flow_b_file = self._prior_file(
+            root,
+            [
+                f"{prev_idx:05d}_b.npz",
+                f"{prev_idx:06d}_b.npz",
+                f"{prev_idx}_b.npz",
+                f"{prev_idx:05d}_b.npy",
+            ],
+        )
+        if not os.path.isfile(flow_f_file) or not os.path.isfile(flow_b_file):
+            self.warn_gaustar_fallback(
+                "flow_missing",
+                f"Bidirectional flow files are missing: {flow_f_file}, {flow_b_file}.",
+            )
+            return None, None
+        try:
+            flow_f = load_flow_file(flow_f_file, target_shape=target_shape)
+            flow_b = load_flow_file(flow_b_file, target_shape=target_shape)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.warn_gaustar_fallback(
+                "flow_bad",
+                f"Unable to load bidirectional flow for frame {idx}: {exc}.",
+            )
+            return None, None
+        self.gaustar_prior_stats["flow"] += 1
+        return torch.from_numpy(flow_f), torch.from_numpy(flow_b)
+
+    def load_prior_valid_mask(self, idx, target_shape):
+        if not self.use_gaustar_stage1:
+            return None
+        root = self.prior_mask_path or os.path.join(
+            self.get_mono_prior_root(), "valid_mask"
+        )
+        names = [
+            f"{idx:05d}.npy",
+            f"{idx:06d}.npy",
+            f"{idx:05d}.npz",
+            f"{idx:06d}.npz",
+            f"{idx:05d}.png",
+            f"{idx:06d}.png",
+        ]
+        mask_file = self._prior_file(root, names)
+        if not os.path.isfile(mask_file):
+            return None
+        try:
+            mask = load_prior_mask_file(mask_file, target_shape=target_shape)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.warn_gaustar_fallback(
+                "mask_bad",
+                f"Unable to load prior valid mask {mask_file}: {exc}.",
+            )
+            return None
+        self.gaustar_prior_stats["mask"] += 1
+        return torch.from_numpy(mask)
+
+    def load_gaustar_priors(self, idx, target_shape):
+        if not self.use_gaustar_stage1:
+            return None
+        priors = {"gaustar_stage1": True}
+        metric_depth = self.load_metric_depth(idx, target_shape)
+        if metric_depth is not None:
+            priors["metric_depth"] = metric_depth
+        flow_f, flow_b = self.load_flow_pair(idx, target_shape)
+        if flow_f is not None and flow_b is not None:
+            priors["flow_prev_to_cur"] = flow_f
+            priors["flow_cur_to_prev"] = flow_b
+        prior_valid_mask = self.load_prior_valid_mask(idx, target_shape)
+        if prior_valid_mask is not None:
+            priors["prior_valid_mask"] = prior_valid_mask
+        return priors
 
     def get_feature_root(self):
         if self.feature_path:
@@ -465,8 +625,13 @@ class MonocularDataset(BaseDataset):
         )
         pose = torch.from_numpy(pose).to(device=self.device)
         features = self.load_features(idx, image=image)
+        priors = self.load_gaustar_priors(idx, (self.height, self.width))
         if self.use_uncertainty:
+            if self.use_gaustar_stage1:
+                return image, depth, pose, features, priors
             return image, depth, pose, features
+        if self.use_gaustar_stage1:
+            return image, depth, pose, priors
         return image, depth, pose
 
 
@@ -583,8 +748,13 @@ class StereoDataset(BaseDataset):
         pose = torch.from_numpy(pose).to(device=self.device)
 
         features = self.load_features(idx, image=image)
+        priors = self.load_gaustar_priors(idx, (self.height, self.width))
         if self.use_uncertainty:
+            if self.use_gaustar_stage1:
+                return image, depth, pose, features, priors
             return image, depth, pose, features
+        if self.use_gaustar_stage1:
+            return image, depth, pose, priors
         return image, depth, pose
 
 
@@ -712,8 +882,13 @@ class RealsenseDataset(BaseDataset):
         )
 
         features = self.load_features(idx, image=image)
+        priors = self.load_gaustar_priors(idx, (self.height, self.width))
         if self.use_uncertainty:
+            if self.use_gaustar_stage1:
+                return image, depth, pose, features, priors
             return image, depth, pose, features
+        if self.use_gaustar_stage1:
+            return image, depth, pose, priors
         return image, depth, pose
 
 
