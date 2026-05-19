@@ -13,9 +13,16 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import (
+    build_rendered_depth_consistency_mask,
     get_loss_tracking,
+    get_metric_depth_for_initialization,
     get_median_depth,
     log_uncertainty_debug_stats,
+)
+from utils.mono_priors.gaustar_stage1 import (
+    gaustar_stage1_enabled,
+    get_gaustar_stage1_config,
+    initialize_pose_from_flow,
 )
 
 
@@ -50,6 +57,10 @@ class FrontEnd(mp.Process):
         self.uncertainty_state_syncs = 0
         self._logged_tracking_uncertainty_warmup = False
         self._logged_tracking_uncertainty_enabled = False
+        self.gaustar_stage1_cfg = get_gaustar_stage1_config(config)
+        self._logged_flow_pose_init = False
+        self._logged_flow_pose_fallback = False
+        self._gaustar_recent_priors = {}
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -109,6 +120,28 @@ class FrontEnd(mp.Process):
             self._logged_tracking_uncertainty_enabled = True
         return self.uncer_network
 
+    def initialize_tracking_pose(self, cur_frame_idx, viewpoint, prev):
+        viewpoint.update_RT(prev.R, prev.T)
+        if not gaustar_stage1_enabled(self.config):
+            return
+        if not getattr(prev, "priors", None) and prev.uid in self._gaustar_recent_priors:
+            prev.priors = self._gaustar_recent_priors[prev.uid]
+        cfg = self.gaustar_stage1_cfg
+        if not cfg.get("use_flow_pose_init", True):
+            return
+        ok, reason = initialize_pose_from_flow(prev, viewpoint, cfg)
+        if ok:
+            if not self._logged_flow_pose_init:
+                print(f"[GauSTAR Stage1] flow pose initialization enabled ({reason})")
+                self._logged_flow_pose_init = True
+            return
+        if not self._logged_flow_pose_fallback:
+            print(
+                "[GauSTAR Stage1] flow pose initialization unavailable "
+                f"({reason}); using previous-frame pose."
+            )
+            self._logged_flow_pose_fallback = True
+
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
         self.kf_indices.append(cur_frame_idx)
@@ -116,6 +149,21 @@ class FrontEnd(mp.Process):
         gt_img = viewpoint.original_image.cuda()
         valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]
         if self.monocular:
+            gaustar_cfg = self.gaustar_stage1_cfg
+            if (
+                gaustar_stage1_enabled(self.config)
+                and gaustar_cfg.get("use_metric3d_depth", True)
+                and gaustar_cfg.get("apply_filter_to_keyframe_depth", True)
+            ):
+                metric_initial_depth = get_metric_depth_for_initialization(
+                    self.config,
+                    viewpoint,
+                    depth=depth,
+                    opacity=opacity,
+                    mask=valid_rgb,
+                )
+                if metric_initial_depth is not None:
+                    return metric_initial_depth.cpu().numpy()[0]
             if depth is None:
                 initial_depth = 2 * torch.ones(1, gt_img.shape[1], gt_img.shape[2])
                 initial_depth += torch.randn_like(initial_depth) * 0.3
@@ -182,7 +230,7 @@ class FrontEnd(mp.Process):
 
     def tracking(self, cur_frame_idx, viewpoint):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
-        viewpoint.update_RT(prev.R, prev.T)
+        self.initialize_tracking_pose(cur_frame_idx, viewpoint, prev)
 
         opt_params = []
         opt_params.append(
@@ -253,6 +301,15 @@ class FrontEnd(mp.Process):
                 break
 
         self.median_depth = get_median_depth(depth, opacity)
+        if getattr(viewpoint, "priors", None) is not None:
+            viewpoint.priors["rendered_depth"] = depth.detach().cpu()
+            consistency_mask = build_rendered_depth_consistency_mask(
+                self.config, depth, opacity, viewpoint
+            )
+            if consistency_mask is not None:
+                viewpoint.priors["rendered_depth_consistency_mask"] = (
+                    consistency_mask.detach().cpu()
+                )
         return render_pkg
 
     def is_keyframe(
@@ -377,6 +434,19 @@ class FrontEnd(mp.Process):
                 self.uncertainty_state_syncs += 1
 
     def cleanup(self, cur_frame_idx):
+        if gaustar_stage1_enabled(self.config):
+            priors = getattr(self.cameras[cur_frame_idx], "priors", {}) or {}
+            retained = {
+                key: priors[key]
+                for key in ("metric_depth", "prior_valid_mask")
+                if key in priors
+            }
+            if retained:
+                retained["gaustar_stage1"] = True
+                self._gaustar_recent_priors[cur_frame_idx] = retained
+            for old_idx in list(self._gaustar_recent_priors.keys()):
+                if old_idx < cur_frame_idx - self.use_every_n_frames:
+                    del self._gaustar_recent_priors[old_idx]
         self.cameras[cur_frame_idx].clean()
         if cur_frame_idx % 10 == 0:
             torch.cuda.empty_cache()

@@ -2,6 +2,12 @@ import torch
 import torch.nn.functional as F
 
 from utils.dyn_uncertainty import mapping_utils
+from utils.mono_priors.gaustar_stage1 import (
+    build_depth_consistency_mask,
+    gaustar_stage1_enabled,
+    get_gaustar_stage1_config,
+    metric_depth_to_tensor,
+)
 
 
 _uncertainty_debug_stats = {
@@ -91,6 +97,66 @@ def get_uncertainty_config(config):
     return config.get("Training", {}).get("uncertainty", {})
 
 
+def build_rendered_depth_consistency_mask(config, depth, opacity, viewpoint):
+    if not gaustar_stage1_enabled(config):
+        return None
+    cfg = get_gaustar_stage1_config(config)
+    if not cfg.get("use_rendered_depth_filter", True):
+        return None
+    priors = getattr(viewpoint, "priors", {}) or {}
+    metric_depth = priors.get("metric_depth")
+    if metric_depth is None:
+        return None
+    prior_valid_mask = priors.get("prior_valid_mask")
+    with torch.no_grad():
+        mask, scale = build_depth_consistency_mask(
+            metric_depth, depth, opacity, cfg, prior_valid_mask=prior_valid_mask
+        )
+        if mask is None:
+            return None
+        min_ratio = cfg.get("tracking_filter_min_ratio", 0.05)
+        if float(mask.float().mean().item()) < min_ratio:
+            return None
+        priors["depth_scale"] = float(scale.detach().cpu().item())
+        return mask.to(device=depth.device, dtype=torch.bool)
+
+
+def get_metric_depth_for_initialization(config, viewpoint, depth=None, opacity=None, mask=None):
+    if not gaustar_stage1_enabled(config):
+        return None
+    cfg = get_gaustar_stage1_config(config)
+    if not cfg.get("use_metric3d_depth", True):
+        return None
+    priors = getattr(viewpoint, "priors", {}) or {}
+    metric_depth = priors.get("metric_depth")
+    if metric_depth is None:
+        return None
+    device = depth.device if depth is not None else viewpoint.original_image.device
+    metric = metric_depth_to_tensor(metric_depth, device=device)
+    if metric is None:
+        return None
+    valid = metric > cfg.get("min_depth", 0.01)
+    if mask is not None:
+        valid = torch.logical_and(valid, mask.to(device=device, dtype=torch.bool))
+
+    if depth is not None and opacity is not None:
+        consistency_mask = build_rendered_depth_consistency_mask(
+            config, depth, opacity, viewpoint
+        )
+        scale = priors.get("depth_scale", None)
+        if consistency_mask is None or scale is None:
+            return None
+        valid = torch.logical_and(valid, consistency_mask)
+        metric = metric * float(scale)
+
+    min_ratio = cfg.get("tracking_filter_min_ratio", 0.05)
+    if float(valid.float().mean().item()) < min_ratio:
+        return None
+    metric = metric.detach().clone()
+    metric[~valid] = 0.0
+    return metric
+
+
 def has_uncertainty_features(viewpoint):
     return getattr(viewpoint, "features", None) is not None
 
@@ -175,6 +241,15 @@ def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint, uncertainty_
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
+    gaustar_cfg = get_gaustar_stage1_config(config)
+    if gaustar_cfg.get("apply_filter_to_tracking", True):
+        consistency_mask = build_rendered_depth_consistency_mask(
+            config, depth, opacity, viewpoint
+        )
+        if consistency_mask is not None:
+            rgb_pixel_mask = torch.logical_and(
+                rgb_pixel_mask.bool(), consistency_mask.bool()
+            ).to(dtype=gt_image.dtype)
     l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
     uncertainty_cfg = get_uncertainty_config(config)
     if (
