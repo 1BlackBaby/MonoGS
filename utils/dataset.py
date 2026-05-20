@@ -11,9 +11,13 @@ from PIL import Image
 from gaussian_splatting.utils.graphics_utils import focal2fov
 from utils.mono_priors.gaustar_stage1 import (
     gaustar_stage1_enabled,
+    get_gaustar_stage1_config,
+    get_metric3d_estimator,
     load_flow_file,
     load_metric_depth_file,
     load_prior_mask_file,
+    predict_metric3d_depth,
+    save_metric_depth_file,
 )
 
 try:
@@ -220,6 +224,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self._feature_extractor = None
         self._feature_extractor_failed = False
         self.use_gaustar_stage1 = gaustar_stage1_enabled(config)
+        self.gaustar_stage1_cfg = get_gaustar_stage1_config(config)
         dataset_cfg = config.get("Dataset", {})
         self.mono_prior_path = dataset_cfg.get("mono_prior_path", "")
         self.metric3d_depth_path = dataset_cfg.get("metric3d_depth_path", "")
@@ -228,6 +233,9 @@ class BaseDataset(torch.utils.data.Dataset):
         self.prior_format = dataset_cfg.get("prior_format", "npy")
         self._warned_gaustar_fallbacks = set()
         self.gaustar_prior_stats = {"metric_depth": 0, "flow": 0, "mask": 0}
+        self._metric_depth_estimator = None
+        self._metric_depth_estimator_failed = False
+        self._logged_metric3d_online_prediction = False
 
     def __len__(self):
         return self.num_imgs
@@ -275,8 +283,64 @@ class BaseDataset(torch.utils.data.Dataset):
                 return path
         return os.path.join(root, names[0])
 
-    def load_metric_depth(self, idx, target_shape):
-        if not self.use_gaustar_stage1:
+    def get_metric_depth_output_root(self):
+        if self.metric3d_depth_path:
+            return self.metric3d_depth_path
+        return os.path.join(self.get_mono_prior_root(), "depths")
+
+    def get_online_metric_depth_estimator(self):
+        if self._metric_depth_estimator_failed:
+            return None
+        if self._metric_depth_estimator is None:
+            try:
+                self._metric_depth_estimator = get_metric3d_estimator(
+                    self.config, self.device
+                )
+                print("[GauSTAR Stage1] Metric3D online depth estimator initialized")
+            except Exception as exc:
+                self._metric_depth_estimator_failed = True
+                self.warn_gaustar_fallback(
+                    "metric3d_estimator_init",
+                    f"Unable to initialize Metric3D online depth estimator: {exc}.",
+                )
+                return None
+        return self._metric_depth_estimator
+
+    def predict_metric_depth_online(self, idx, image, output_file):
+        if image is None:
+            return None
+        model = self.get_online_metric_depth_estimator()
+        if model is None:
+            return None
+        try:
+            depth = predict_metric3d_depth(model, image, self.config, self.device)
+        except Exception as exc:
+            self.warn_gaustar_fallback(
+                "metric3d_predict",
+                f"Unable to predict Metric3D depth for frame {idx}: {exc}.",
+            )
+            return None
+        if self.gaustar_stage1_cfg.get("cache_metric3d_depth", True):
+            try:
+                save_metric_depth_file(depth, output_file)
+            except OSError as exc:
+                self.warn_gaustar_fallback(
+                    "metric3d_cache",
+                    f"Unable to cache Metric3D depth file {output_file}: {exc}.",
+                )
+        if not self._logged_metric3d_online_prediction:
+            print(
+                "[GauSTAR Stage1] Metric3D online depth prediction enabled; "
+                f"cache root={os.path.dirname(output_file)}"
+            )
+            self._logged_metric3d_online_prediction = True
+        return depth.detach().cpu()
+
+    def load_metric_depth(self, idx, target_shape, image=None):
+        if (
+            not self.use_gaustar_stage1
+            or not self.gaustar_stage1_cfg.get("use_metric3d_depth", True)
+        ):
             return None
         if self.metric3d_depth_path:
             roots = [self.metric3d_depth_path]
@@ -291,6 +355,8 @@ class BaseDataset(torch.utils.data.Dataset):
             f"{idx:06d}.{self.prior_format}",
             f"{idx}.{self.prior_format}",
         ]
+        if self.prior_format != "npy":
+            names += [f"{idx:05d}.npy", f"{idx:06d}.npy", f"{idx}.npy"]
         depth_file = None
         for root in roots:
             candidate = self._prior_file(root, names)
@@ -300,11 +366,18 @@ class BaseDataset(torch.utils.data.Dataset):
         if depth_file is None:
             depth_file = self._prior_file(roots[0], names)
         if not os.path.isfile(depth_file):
-            self.warn_gaustar_fallback(
-                "metric_depth_missing",
-                f"Metric3D depth file is missing. Checked roots: {roots}.",
+            output_file = os.path.join(
+                self.get_metric_depth_output_root(), f"{idx:05d}.npy"
             )
-            return None
+            depth = self.predict_metric_depth_online(idx, image, output_file)
+            if depth is None:
+                self.warn_gaustar_fallback(
+                    "metric_depth_missing",
+                    f"Metric3D depth file is missing. Checked roots: {roots}.",
+                )
+                return None
+            self.gaustar_prior_stats["metric_depth"] += 1
+            return depth
         try:
             depth = load_metric_depth_file(depth_file, target_shape=target_shape)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -385,11 +458,11 @@ class BaseDataset(torch.utils.data.Dataset):
         self.gaustar_prior_stats["mask"] += 1
         return torch.from_numpy(mask)
 
-    def load_gaustar_priors(self, idx, target_shape):
+    def load_gaustar_priors(self, idx, target_shape, image=None):
         if not self.use_gaustar_stage1:
             return None
         priors = {"gaustar_stage1": True}
-        metric_depth = self.load_metric_depth(idx, target_shape)
+        metric_depth = self.load_metric_depth(idx, target_shape, image=image)
         if metric_depth is not None:
             priors["metric_depth"] = metric_depth
         flow_f, flow_b = self.load_flow_pair(idx, target_shape)
@@ -625,7 +698,7 @@ class MonocularDataset(BaseDataset):
         )
         pose = torch.from_numpy(pose).to(device=self.device)
         features = self.load_features(idx, image=image)
-        priors = self.load_gaustar_priors(idx, (self.height, self.width))
+        priors = self.load_gaustar_priors(idx, (self.height, self.width), image=image)
         if self.use_uncertainty:
             if self.use_gaustar_stage1:
                 return image, depth, pose, features, priors
@@ -748,7 +821,7 @@ class StereoDataset(BaseDataset):
         pose = torch.from_numpy(pose).to(device=self.device)
 
         features = self.load_features(idx, image=image)
-        priors = self.load_gaustar_priors(idx, (self.height, self.width))
+        priors = self.load_gaustar_priors(idx, (self.height, self.width), image=image)
         if self.use_uncertainty:
             if self.use_gaustar_stage1:
                 return image, depth, pose, features, priors
@@ -882,7 +955,7 @@ class RealsenseDataset(BaseDataset):
         )
 
         features = self.load_features(idx, image=image)
-        priors = self.load_gaustar_priors(idx, (self.height, self.width))
+        priors = self.load_gaustar_priors(idx, (self.height, self.width), image=image)
         if self.use_uncertainty:
             if self.use_gaustar_stage1:
                 return image, depth, pose, features, priors

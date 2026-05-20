@@ -3,6 +3,7 @@ import os
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 DEFAULT_GAUSTAR_STAGE1_CFG = {
@@ -24,7 +25,28 @@ DEFAULT_GAUSTAR_STAGE1_CFG = {
     "apply_filter_to_tracking": True,
     "apply_filter_to_keyframe_depth": True,
     "apply_filter_to_render_guided_densification": True,
+    "require_rendered_depth_for_keyframe_depth": True,
+    "flow_pose_after_init": True,
+    "flow_pose_compare_init_loss": True,
+    "flow_pose_loss_improvement": 0.0,
+    "max_flow_pose_translation_ratio": 0.5,
+    "max_flow_pose_rotation_deg": 20.0,
+    "use_depth_scale_for_flow_pose": True,
+    "apply_filter_after_init": True,
+    "tracking_filter_soft_weight": 0.3,
     "min_depth": 0.01,
+    "metric3d_model": "metric3d_vit_large",
+    "metric3d_image_size": [616, 1064],
+    "metric3d_max_depth": 300.0,
+    "cache_metric3d_depth": True,
+    "precompute_flow": False,
+    "raft_root": "",
+    "raft_checkpoint": "",
+    "flow_iters": 20,
+    "flow_skip_existing": True,
+    "flow_small": False,
+    "flow_mixed_precision": False,
+    "flow_alternate_corr": False,
 }
 
 
@@ -103,6 +125,79 @@ def sanitize_flow(flow, target_shape=None):
 
 def load_metric_depth_file(path, target_shape=None):
     return sanitize_depth(_load_array(path, ("depth", "metric_depth", "arr_0")), target_shape)
+
+
+def get_metric3d_model_name(config):
+    cfg = get_gaustar_stage1_config(config)
+    return config.get("mono_prior", {}).get(
+        "depth", cfg.get("metric3d_model", "metric3d_vit_large")
+    )
+
+
+def get_metric3d_estimator(config, device):
+    depth_model = get_metric3d_model_name(config)
+    if "metric3d_vit" not in depth_model:
+        raise NotImplementedError(f"Unsupported Metric3D model: {depth_model}")
+    model = torch.hub.load("yvanyin/metric3d", depth_model, pretrain=True)
+    return model.to(device).eval()
+
+
+@torch.no_grad()
+def predict_metric3d_depth(model, input_tensor, config, device):
+    cfg = get_gaustar_stage1_config(config)
+    image_size = cfg.get("metric3d_image_size", [616, 1064])
+    image_size = (int(image_size[0]), int(image_size[1]))
+    input_tensor = input_tensor.to(device=device, dtype=torch.float32)
+    if input_tensor.ndim == 3:
+        input_tensor = input_tensor[None]
+    h, w = input_tensor.shape[-2:]
+    scale = min(image_size[0] / h, image_size[1] / w)
+    resized_h = max(1, int(h * scale))
+    resized_w = max(1, int(w * scale))
+
+    img_tensor = F.interpolate(
+        input_tensor,
+        size=(resized_h, resized_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=img_tensor.dtype)[
+        None, :, None, None
+    ]
+    std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=img_tensor.dtype)[
+        None, :, None, None
+    ]
+    img_tensor = (img_tensor - mean) / std
+
+    pad_h = image_size[0] - resized_h
+    pad_w = image_size[1] - resized_w
+    pad_h_half = pad_h // 2
+    pad_w_half = pad_w // 2
+    img_tensor = F.pad(
+        img_tensor,
+        (pad_w_half, pad_w - pad_w_half, pad_h_half, pad_h - pad_h_half),
+        mode="constant",
+        value=0.0,
+    )
+
+    pred_depth, _, _ = model.inference({"input": img_tensor})
+    pred_depth = pred_depth.squeeze()
+    end_h = pred_depth.shape[0] - (pad_h - pad_h_half)
+    end_w = pred_depth.shape[1] - (pad_w - pad_w_half)
+    pred_depth = pred_depth[pad_h_half:end_h, pad_w_half:end_w]
+    pred_depth = F.interpolate(
+        pred_depth[None, None], size=(h, w), mode="bicubic", align_corners=False
+    ).squeeze()
+
+    fx = float(config["Dataset"]["Calibration"]["fx"])
+    pred_depth = pred_depth * (fx / 1000.0)
+    return torch.clamp(pred_depth, 0, float(cfg.get("metric3d_max_depth", 300.0)))
+
+
+def save_metric_depth_file(depth, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    depth_np = depth.detach().cpu().float().numpy().astype(np.float32)
+    np.save(path, depth_np)
 
 
 def load_flow_file(path, target_shape=None):
@@ -262,6 +357,10 @@ def initialize_pose_from_flow(prev_viewpoint, viewpoint, cfg):
         else np.asarray(metric_depth)
     )
     metric_depth = sanitize_depth(metric_depth, (viewpoint.image_height, viewpoint.image_width))
+    if cfg.get("use_depth_scale_for_flow_pose", True):
+        depth_scale = prev_priors.get("depth_scale")
+        if depth_scale is not None:
+            metric_depth = metric_depth * float(depth_scale)
 
     h, w = metric_depth.shape
     ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)

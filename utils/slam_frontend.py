@@ -60,6 +60,7 @@ class FrontEnd(mp.Process):
         self.gaustar_stage1_cfg = get_gaustar_stage1_config(config)
         self._logged_flow_pose_init = False
         self._logged_flow_pose_fallback = False
+        self._logged_flow_pose_reject = False
         self._gaustar_recent_priors = {}
 
     def set_hyperparams(self):
@@ -120,6 +121,44 @@ class FrontEnd(mp.Process):
             self._logged_tracking_uncertainty_enabled = True
         return self.uncer_network
 
+    def flow_pose_delta_reason(self, prev_R, prev_T, cur_R, cur_T):
+        cfg = self.gaustar_stage1_cfg
+        rel_R = cur_R @ prev_R.transpose(0, 1)
+        cos_theta = torch.clamp((torch.trace(rel_R) - 1.0) * 0.5, -1.0, 1.0)
+        rot_deg = float(torch.rad2deg(torch.arccos(cos_theta)).detach().cpu().item())
+        trans = float(torch.linalg.norm(cur_T - prev_T).detach().cpu().item())
+
+        max_rot = float(cfg.get("max_flow_pose_rotation_deg", 0.0))
+        if max_rot > 0 and rot_deg > max_rot:
+            return False, f"rotation too large ({rot_deg:.3f} deg)"
+
+        max_trans_ratio = float(cfg.get("max_flow_pose_translation_ratio", 0.0))
+        if max_trans_ratio > 0 and hasattr(self, "median_depth"):
+            max_trans = max_trans_ratio * float(self.median_depth.detach().cpu().item())
+            if trans > max_trans:
+                return False, f"translation too large ({trans:.3f} > {max_trans:.3f})"
+        return True, f"delta trans={trans:.3f}, rot={rot_deg:.3f}"
+
+    def tracking_init_loss(self, viewpoint):
+        with torch.no_grad():
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background
+            )
+            image, depth, opacity = (
+                render_pkg["render"],
+                render_pkg["depth"],
+                render_pkg["opacity"],
+            )
+            loss = get_loss_tracking(
+                self.config,
+                image,
+                depth,
+                opacity,
+                viewpoint,
+                uncertainty_network=None,
+            )
+        return float(loss.detach().cpu().item())
+
     def initialize_tracking_pose(self, cur_frame_idx, viewpoint, prev):
         viewpoint.update_RT(prev.R, prev.T)
         if not gaustar_stage1_enabled(self.config):
@@ -129,10 +168,48 @@ class FrontEnd(mp.Process):
         cfg = self.gaustar_stage1_cfg
         if not cfg.get("use_flow_pose_init", True):
             return
+        if cfg.get("flow_pose_after_init", True) and not self.initialized:
+            return
+        prev_R = prev.R.detach().clone()
+        prev_T = prev.T.detach().clone()
         ok, reason = initialize_pose_from_flow(prev, viewpoint, cfg)
         if ok:
+            delta_ok, delta_reason = self.flow_pose_delta_reason(
+                prev_R, prev_T, viewpoint.R, viewpoint.T
+            )
+            if not delta_ok:
+                viewpoint.update_RT(prev_R, prev_T)
+                if not self._logged_flow_pose_reject:
+                    print(
+                        "[GauSTAR Stage1] flow pose initialization rejected "
+                        f"({delta_reason}); using previous-frame pose."
+                    )
+                    self._logged_flow_pose_reject = True
+                return
+
+            if cfg.get("flow_pose_compare_init_loss", True):
+                pnp_R = viewpoint.R.detach().clone()
+                pnp_T = viewpoint.T.detach().clone()
+                pnp_loss = self.tracking_init_loss(viewpoint)
+                viewpoint.update_RT(prev_R, prev_T)
+                prev_loss = self.tracking_init_loss(viewpoint)
+                improvement = float(cfg.get("flow_pose_loss_improvement", 0.0))
+                if pnp_loss > prev_loss * (1.0 - improvement):
+                    if not self._logged_flow_pose_reject:
+                        print(
+                            "[GauSTAR Stage1] flow pose initialization rejected "
+                            f"(pnp_loss={pnp_loss:.6f}, prev_loss={prev_loss:.6f}); "
+                            "using previous-frame pose."
+                        )
+                        self._logged_flow_pose_reject = True
+                    return
+                viewpoint.update_RT(pnp_R, pnp_T)
+
             if not self._logged_flow_pose_init:
-                print(f"[GauSTAR Stage1] flow pose initialization enabled ({reason})")
+                print(
+                    "[GauSTAR Stage1] flow pose initialization enabled "
+                    f"({reason})"
+                )
                 self._logged_flow_pose_init = True
             return
         if not self._logged_flow_pose_fallback:
@@ -273,6 +350,8 @@ class FrontEnd(mp.Process):
                 render_pkg["opacity"],
             )
             pose_optimizer.zero_grad()
+            if getattr(viewpoint, "priors", None) is not None:
+                viewpoint.priors["slam_initialized"] = self.initialized
             loss_tracking = get_loss_tracking(
                 self.config,
                 image,

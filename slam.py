@@ -19,6 +19,7 @@ from utils.dataset import load_dataset
 from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import FakeQueue
+from utils.mono_priors.flow_precompute import precompute_flow_priors
 from utils.dyn_uncertainty import generate_uncertainty_mlp
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
@@ -57,6 +58,7 @@ class SLAM:
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
         )
+        precompute_flow_priors(self.dataset, self.config, device="cuda")
 
         self.gaussians.training_setup(opt_params)
         bg_color = [0, 0, 0]

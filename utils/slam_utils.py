@@ -127,6 +127,11 @@ def get_metric_depth_for_initialization(config, viewpoint, depth=None, opacity=N
     cfg = get_gaustar_stage1_config(config)
     if not cfg.get("use_metric3d_depth", True):
         return None
+    if (
+        cfg.get("require_rendered_depth_for_keyframe_depth", True)
+        and (depth is None or opacity is None)
+    ):
+        return None
     priors = getattr(viewpoint, "priors", {}) or {}
     metric_depth = priors.get("metric_depth")
     if metric_depth is None:
@@ -243,13 +248,26 @@ def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint, uncertainty_
     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
     gaustar_cfg = get_gaustar_stage1_config(config)
     if gaustar_cfg.get("apply_filter_to_tracking", True):
-        consistency_mask = build_rendered_depth_consistency_mask(
-            config, depth, opacity, viewpoint
-        )
+        priors = getattr(viewpoint, "priors", {}) or {}
+        initialized = bool(priors.get("slam_initialized", False))
+        consistency_mask = None
+        if initialized or not gaustar_cfg.get("apply_filter_after_init", True):
+            consistency_mask = build_rendered_depth_consistency_mask(
+                config, depth, opacity, viewpoint
+            )
         if consistency_mask is not None:
-            rgb_pixel_mask = torch.logical_and(
-                rgb_pixel_mask.bool(), consistency_mask.bool()
-            ).to(dtype=gt_image.dtype)
+            soft_weight = float(gaustar_cfg.get("tracking_filter_soft_weight", 0.0))
+            if soft_weight > 0:
+                weight = torch.where(
+                    consistency_mask.bool(),
+                    torch.ones_like(rgb_pixel_mask, dtype=gt_image.dtype),
+                    torch.full_like(rgb_pixel_mask, soft_weight, dtype=gt_image.dtype),
+                )
+                rgb_pixel_mask = rgb_pixel_mask * weight
+            else:
+                rgb_pixel_mask = torch.logical_and(
+                    rgb_pixel_mask.bool(), consistency_mask.bool()
+                ).to(dtype=gt_image.dtype)
     l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
     uncertainty_cfg = get_uncertainty_config(config)
     if (
