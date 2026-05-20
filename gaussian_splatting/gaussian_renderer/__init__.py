@@ -29,6 +29,7 @@ def render(
     scaling_modifier=1.0,
     override_color=None,
     mask=None,
+    pose_delta_override=None,
 ):
     """
     Render the scene.
@@ -113,6 +114,11 @@ def render(
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    if pose_delta_override is None:
+        theta = viewpoint_camera.cam_rot_delta
+        rho = viewpoint_camera.cam_trans_delta
+    else:
+        theta, rho = pose_delta_override
     if mask is not None:
         rendered_image, radii, depth, opacity = rasterizer(
             means3D=means3D[mask],
@@ -123,8 +129,8 @@ def render(
             scales=scales[mask],
             rotations=rotations[mask],
             cov3D_precomp=cov3D_precomp[mask] if cov3D_precomp is not None else None,
-            theta=viewpoint_camera.cam_rot_delta,
-            rho=viewpoint_camera.cam_trans_delta,
+            theta=theta,
+            rho=rho,
         )
     else:
         rendered_image, radii, depth, opacity, n_touched = rasterizer(
@@ -136,8 +142,8 @@ def render(
             scales=scales,
             rotations=rotations,
             cov3D_precomp=cov3D_precomp,
-            theta=viewpoint_camera.cam_rot_delta,
-            rho=viewpoint_camera.cam_trans_delta,
+            theta=theta,
+            rho=rho,
         )
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.

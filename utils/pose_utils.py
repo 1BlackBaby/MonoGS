@@ -73,20 +73,42 @@ def SE3_exp(tau):
     return T
 
 
+def camera_w2c(camera):
+    T_w2c = torch.eye(4, device=camera.R.device, dtype=camera.R.dtype)
+    T_w2c[0:3, 0:3] = camera.R
+    T_w2c[0:3, 3] = camera.T
+    return T_w2c
+
+
+def update_camera_from_w2c(camera, T_w2c):
+    camera.update_RT(T_w2c[0:3, 0:3], T_w2c[0:3, 3])
+
+
+def get_virtual_camera_delta(camera, sample):
+    sample = torch.as_tensor(
+        sample, device=camera.cam_rot_delta.device, dtype=camera.cam_rot_delta.dtype
+    )
+    rot_delta = camera.cam_rot_delta + sample * camera.blur_rot_delta
+    trans_delta = camera.cam_trans_delta + sample * camera.blur_trans_delta
+    return rot_delta, trans_delta
+
+
+def reset_blur_motion(camera):
+    if getattr(camera, "blur_rot_delta", None) is None:
+        return
+    camera.blur_rot_delta.data.fill_(0)
+    camera.blur_trans_delta.data.fill_(0)
+
+
 def update_pose(camera, converged_threshold=1e-4):
     tau = torch.cat([camera.cam_trans_delta, camera.cam_rot_delta], axis=0)
 
-    T_w2c = torch.eye(4, device=tau.device)
-    T_w2c[0:3, 0:3] = camera.R
-    T_w2c[0:3, 3] = camera.T
+    T_w2c = camera_w2c(camera)
 
     new_w2c = SE3_exp(tau) @ T_w2c
 
-    new_R = new_w2c[0:3, 0:3]
-    new_T = new_w2c[0:3, 3]
-
     converged = tau.norm() < converged_threshold
-    camera.update_RT(new_R, new_T)
+    update_camera_from_w2c(camera, new_w2c)
 
     camera.cam_rot_delta.data.fill_(0)
     camera.cam_trans_delta.data.fill_(0)

@@ -50,6 +50,12 @@ Training:
   kf_overlap: 0.9
   kf_cutoff: 0.3
   prune_mode: 'slam'
+  blur_aware_tracking:
+    enabled: False
+    num_virtual_views: 3
+    shutter_ratio: 1.0
+    motion_l2: 0.001
+    start_after_keyframes: 2
   gaustar_stage1:
     enabled: False
     use_metric3d_depth: True
