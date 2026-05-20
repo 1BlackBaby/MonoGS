@@ -56,6 +56,8 @@ class Camera(nn.Module):
         self.cam_trans_delta = nn.Parameter(
             torch.zeros(3, requires_grad=True, device=device)
         )
+        self.blur_rot_delta = None
+        self.blur_trans_delta = None
 
         self.exposure_a = nn.Parameter(
             torch.tensor([0.0], requires_grad=True, device=device)
@@ -168,6 +170,8 @@ class Camera(nn.Module):
 
         self.cam_rot_delta = None
         self.cam_trans_delta = None
+        self.blur_rot_delta = None
+        self.blur_trans_delta = None
 
         self.exposure_a = None
         self.exposure_b = None

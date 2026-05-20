@@ -7,11 +7,18 @@ import torch.multiprocessing as mp
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
 from gui import gui_utils
+from utils.blur_tracking import (
+    blur_aware_tracking_ready,
+    blur_motion_l2,
+    ensure_blur_motion_params,
+    get_blur_tracking_config,
+    render_blur_aware_tracking,
+)
 from utils.camera_utils import Camera
 from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
-from utils.pose_utils import update_pose
+from utils.pose_utils import reset_blur_motion, update_pose
 from utils.slam_utils import (
     build_rendered_depth_consistency_mask,
     get_loss_tracking,
@@ -62,6 +69,9 @@ class FrontEnd(mp.Process):
         self._logged_flow_pose_fallback = False
         self._logged_flow_pose_reject = False
         self._gaustar_recent_priors = {}
+        self.blur_tracking_cfg = get_blur_tracking_config(config)
+        self._logged_blur_tracking_warmup = False
+        self._logged_blur_tracking_enabled = False
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -80,6 +90,28 @@ class FrontEnd(mp.Process):
         self.tracking_uncertainty_warmup_backend_syncs = uncertainty_cfg.get(
             "tracking_warmup_backend_syncs", 0
         )
+        self.blur_tracking_cfg = get_blur_tracking_config(self.config)
+
+    def use_blur_aware_tracking(self):
+        if not self.blur_tracking_cfg["enabled"]:
+            return False
+        if not blur_aware_tracking_ready(self.blur_tracking_cfg, len(self.kf_indices)):
+            if not self._logged_blur_tracking_warmup:
+                print(
+                    "[BlurTrack] warmup: "
+                    f"keyframes={len(self.kf_indices)}/"
+                    f"{self.blur_tracking_cfg['start_after_keyframes']}"
+                )
+                self._logged_blur_tracking_warmup = True
+            return False
+        if not self._logged_blur_tracking_enabled:
+            print(
+                "[BlurTrack] enabled: "
+                f"num_virtual_views={self.blur_tracking_cfg['num_virtual_views']}, "
+                f"shutter_ratio={self.blur_tracking_cfg['shutter_ratio']}"
+            )
+            self._logged_blur_tracking_enabled = True
+        return True
 
     def get_tracking_uncertainty_network(self):
         uncertainty_cfg = self.config.get("Training", {}).get("uncertainty", {})
@@ -308,6 +340,9 @@ class FrontEnd(mp.Process):
     def tracking(self, cur_frame_idx, viewpoint):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         self.initialize_tracking_pose(cur_frame_idx, viewpoint, prev)
+        use_blur_tracking = self.use_blur_aware_tracking()
+        if use_blur_tracking:
+            ensure_blur_motion_params(viewpoint)
 
         opt_params = []
         opt_params.append(
@@ -324,6 +359,27 @@ class FrontEnd(mp.Process):
                 "name": "trans_{}".format(viewpoint.uid),
             }
         )
+        if use_blur_tracking:
+            opt_params.append(
+                {
+                    "params": [viewpoint.blur_rot_delta],
+                    "lr": self.config["Training"]["lr"].get(
+                        "blur_rot_delta",
+                        self.config["Training"]["lr"]["cam_rot_delta"],
+                    ),
+                    "name": "blur_rot_{}".format(viewpoint.uid),
+                }
+            )
+            opt_params.append(
+                {
+                    "params": [viewpoint.blur_trans_delta],
+                    "lr": self.config["Training"]["lr"].get(
+                        "blur_trans_delta",
+                        self.config["Training"]["lr"]["cam_trans_delta"],
+                    ),
+                    "name": "blur_trans_{}".format(viewpoint.uid),
+                }
+            )
         opt_params.append(
             {
                 "params": [viewpoint.exposure_a],
@@ -340,44 +396,63 @@ class FrontEnd(mp.Process):
         )
 
         pose_optimizer = torch.optim.Adam(opt_params)
-        for tracking_itr in range(self.tracking_itr_num):
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
-            )
-            image, depth, opacity = (
-                render_pkg["render"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-            )
-            pose_optimizer.zero_grad()
-            if getattr(viewpoint, "priors", None) is not None:
-                viewpoint.priors["slam_initialized"] = self.initialized
-            loss_tracking = get_loss_tracking(
-                self.config,
-                image,
-                depth,
-                opacity,
-                viewpoint,
-                uncertainty_network=self.get_tracking_uncertainty_network(),
-            )
-            loss_tracking.backward()
-
-            with torch.no_grad():
-                pose_optimizer.step()
-                converged = update_pose(viewpoint)
-
-            if tracking_itr % 10 == 0:
-                self.q_main2vis.put(
-                    gui_utils.GaussianPacket(
-                        current_frame=viewpoint,
-                        gtcolor=viewpoint.original_image,
-                        gtdepth=viewpoint.depth
-                        if not self.monocular
-                        else np.zeros((viewpoint.image_height, viewpoint.image_width)),
+        try:
+            for tracking_itr in range(self.tracking_itr_num):
+                if use_blur_tracking:
+                    render_pkg = render_blur_aware_tracking(
+                        viewpoint,
+                        self.gaussians,
+                        self.pipeline_params,
+                        self.background,
+                        self.blur_tracking_cfg,
                     )
+                else:
+                    render_pkg = render(
+                        viewpoint, self.gaussians, self.pipeline_params, self.background
+                    )
+                image, depth, opacity = (
+                    render_pkg["render"],
+                    render_pkg["depth"],
+                    render_pkg["opacity"],
                 )
-            if converged:
-                break
+                pose_optimizer.zero_grad()
+                if getattr(viewpoint, "priors", None) is not None:
+                    viewpoint.priors["slam_initialized"] = self.initialized
+                loss_tracking = get_loss_tracking(
+                    self.config,
+                    image,
+                    depth,
+                    opacity,
+                    viewpoint,
+                    uncertainty_network=self.get_tracking_uncertainty_network(),
+                )
+                if use_blur_tracking:
+                    loss_tracking = loss_tracking + blur_motion_l2(
+                        viewpoint, self.blur_tracking_cfg
+                    )
+                loss_tracking.backward()
+
+                with torch.no_grad():
+                    pose_optimizer.step()
+                    converged = update_pose(viewpoint)
+
+                if tracking_itr % 10 == 0:
+                    self.q_main2vis.put(
+                        gui_utils.GaussianPacket(
+                            current_frame=viewpoint,
+                            gtcolor=viewpoint.original_image,
+                            gtdepth=viewpoint.depth
+                            if not self.monocular
+                            else np.zeros(
+                                (viewpoint.image_height, viewpoint.image_width)
+                            ),
+                        )
+                    )
+                if converged:
+                    break
+        finally:
+            if use_blur_tracking:
+                reset_blur_motion(viewpoint)
 
         self.median_depth = get_median_depth(depth, opacity)
         if getattr(viewpoint, "priors", None) is not None:
