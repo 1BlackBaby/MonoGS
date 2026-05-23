@@ -63,6 +63,17 @@ Training:
     min_tracking_iterations: 15
     debug: False
 
+  lsg_slam:
+    enabled: False
+  lsg_pose_init:
+    enabled: False
+    pose_after_init: True
+    max_keypoints: 1024
+    match_topk: 512
+    min_matches: 20
+    min_pnp_inliers: 20
+    min_inlier_ratio: 0.25
+
   gaustar_stage1:
     enabled: False
     use_metric3d_depth: True

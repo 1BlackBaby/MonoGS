@@ -165,6 +165,8 @@ class Camera(nn.Module):
         self.original_image = None
         self.depth = None
         self.features = None
+        if hasattr(self, "lsg_local_features"):
+            del self.lsg_local_features
         self.priors = {}
         self.grad_mask = None
 
