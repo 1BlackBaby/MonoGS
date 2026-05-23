@@ -103,7 +103,7 @@ def reset_blur_motion(camera):
 def update_pose(camera, converged_threshold=1e-4):
     tau = torch.cat([camera.cam_trans_delta, camera.cam_rot_delta], axis=0)
 
-    T_w2c = camera_w2c(camera)
+    T_w2c = camera_w2c(camera).to(device=tau.device, dtype=tau.dtype)
 
     new_w2c = SE3_exp(tau) @ T_w2c
 

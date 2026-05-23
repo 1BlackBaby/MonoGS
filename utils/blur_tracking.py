@@ -11,6 +11,10 @@ DEFAULT_BLUR_TRACKING_CONFIG = {
     "shutter_ratio": 1.0,
     "motion_l2": 0.001,
     "start_after_keyframes": 2,
+    "init_motion_from_previous": True,
+    "init_motion_scale": 1.0,
+    "min_tracking_iterations": 15,
+    "debug": False,
 }
 
 
@@ -70,6 +74,21 @@ def get_blur_tracking_config(config):
         blur_cfg["start_after_keyframes"],
         "Training.blur_aware_tracking.start_after_keyframes",
     )
+    blur_cfg["init_motion_from_previous"] = _parse_bool(
+        blur_cfg["init_motion_from_previous"],
+        "Training.blur_aware_tracking.init_motion_from_previous",
+    )
+    blur_cfg["init_motion_scale"] = _parse_nonnegative_float(
+        blur_cfg["init_motion_scale"],
+        "Training.blur_aware_tracking.init_motion_scale",
+    )
+    blur_cfg["min_tracking_iterations"] = _parse_nonnegative_int(
+        blur_cfg["min_tracking_iterations"],
+        "Training.blur_aware_tracking.min_tracking_iterations",
+    )
+    blur_cfg["debug"] = _parse_bool(
+        blur_cfg["debug"], "Training.blur_aware_tracking.debug"
+    )
     return blur_cfg
 
 
@@ -96,6 +115,58 @@ def blur_motion_l2(viewpoint, blur_cfg):
         viewpoint.blur_rot_delta.square().sum()
         + viewpoint.blur_trans_delta.square().sum()
     )
+
+
+def _so3_log(rotation):
+    cos_theta = torch.clamp((torch.trace(rotation) - 1.0) * 0.5, -1.0, 1.0)
+    theta = torch.arccos(cos_theta)
+    vee = torch.stack(
+        [
+            rotation[2, 1] - rotation[1, 2],
+            rotation[0, 2] - rotation[2, 0],
+            rotation[1, 0] - rotation[0, 1],
+        ]
+    )
+    if float(theta.detach().abs().cpu().item()) < 1e-5:
+        return 0.5 * vee
+    return theta / (2.0 * torch.sin(theta)) * vee
+
+
+def initialize_blur_motion_from_previous_frame(viewpoint, prev, prev_prev, blur_cfg):
+    if not blur_cfg.get("init_motion_from_previous", True) or prev_prev is None:
+        return False
+
+    ensure_blur_motion_params(viewpoint)
+    scale = blur_cfg["init_motion_scale"]
+    device = viewpoint.cam_rot_delta.device
+    dtype = viewpoint.cam_rot_delta.dtype
+    with torch.no_grad():
+        prev_R = prev.R.to(device=device, dtype=dtype)
+        prev_prev_R = prev_prev.R.to(device=device, dtype=dtype)
+        rel_R = prev_R @ prev_prev_R.transpose(0, 1)
+        rot_delta = _so3_log(rel_R)
+
+        prev_T = prev.T.to(device=device, dtype=dtype)
+        prev_prev_T = prev_prev.T.to(device=device, dtype=dtype)
+        trans_delta = prev_T - prev_prev_T
+
+        viewpoint.blur_rot_delta.copy_(rot_delta * scale)
+        viewpoint.blur_trans_delta.copy_(trans_delta * scale)
+    return True
+
+
+def should_stop_blur_tracking(converged, tracking_itr, blur_cfg):
+    if not converged:
+        return False
+    return tracking_itr + 1 >= blur_cfg["min_tracking_iterations"]
+
+
+def blur_motion_norms(viewpoint):
+    if getattr(viewpoint, "blur_rot_delta", None) is None:
+        return 0.0, 0.0
+    rot_norm = float(viewpoint.blur_rot_delta.detach().norm().cpu().item())
+    trans_norm = float(viewpoint.blur_trans_delta.detach().norm().cpu().item())
+    return rot_norm, trans_norm
 
 
 def blur_sample_factors(num_virtual_views, shutter_ratio, device, dtype):

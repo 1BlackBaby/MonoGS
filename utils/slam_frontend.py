@@ -9,10 +9,13 @@ from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWor
 from gui import gui_utils
 from utils.blur_tracking import (
     blur_aware_tracking_ready,
+    blur_motion_norms,
     blur_motion_l2,
     ensure_blur_motion_params,
     get_blur_tracking_config,
+    initialize_blur_motion_from_previous_frame,
     render_blur_aware_tracking,
+    should_stop_blur_tracking,
 )
 from utils.camera_utils import Camera
 from utils.eval_utils import eval_ate, save_gaussians
@@ -72,6 +75,14 @@ class FrontEnd(mp.Process):
         self.blur_tracking_cfg = get_blur_tracking_config(config)
         self._logged_blur_tracking_warmup = False
         self._logged_blur_tracking_enabled = False
+        self.blur_tracking_debug_stats = {
+            "frames": 0,
+            "initialized": 0,
+            "rot_norm_sum": 0.0,
+            "trans_norm_sum": 0.0,
+            "rot_norm_max": 0.0,
+            "trans_norm_max": 0.0,
+        }
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -112,6 +123,52 @@ class FrontEnd(mp.Process):
             )
             self._logged_blur_tracking_enabled = True
         return True
+
+    def record_blur_tracking_debug(
+        self,
+        cur_frame_idx,
+        tracking_itr,
+        loss_tracking,
+        viewpoint,
+        motion_initialized,
+    ):
+        rot_norm, trans_norm = blur_motion_norms(viewpoint)
+        stats = self.blur_tracking_debug_stats
+        stats["frames"] += 1
+        stats["initialized"] += int(motion_initialized)
+        stats["rot_norm_sum"] += rot_norm
+        stats["trans_norm_sum"] += trans_norm
+        stats["rot_norm_max"] = max(stats["rot_norm_max"], rot_norm)
+        stats["trans_norm_max"] = max(stats["trans_norm_max"], trans_norm)
+
+        if self.blur_tracking_cfg["debug"]:
+            loss_value = (
+                float(loss_tracking.detach().cpu().item())
+                if loss_tracking is not None
+                else float("nan")
+            )
+            print(
+                "[BlurTrack] frame="
+                f"{cur_frame_idx}, iters={tracking_itr + 1}, "
+                f"init_motion={motion_initialized}, "
+                f"rot_norm={rot_norm:.6f}, trans_norm={trans_norm:.6f}, "
+                f"loss={loss_value:.6f}"
+            )
+
+    def log_blur_tracking_debug_stats(self, tag=""):
+        stats = self.blur_tracking_debug_stats
+        if stats["frames"] == 0:
+            return
+        frames = stats["frames"]
+        print(
+            f"[BlurTrack] stats{tag}: "
+            f"frames={frames}, "
+            f"initialized={stats['initialized']}, "
+            f"avg_rot_norm={stats['rot_norm_sum'] / frames:.6f}, "
+            f"avg_trans_norm={stats['trans_norm_sum'] / frames:.6f}, "
+            f"max_rot_norm={stats['rot_norm_max']:.6f}, "
+            f"max_trans_norm={stats['trans_norm_max']:.6f}"
+        )
 
     def get_tracking_uncertainty_network(self):
         uncertainty_cfg = self.config.get("Training", {}).get("uncertainty", {})
@@ -341,8 +398,13 @@ class FrontEnd(mp.Process):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         self.initialize_tracking_pose(cur_frame_idx, viewpoint, prev)
         use_blur_tracking = self.use_blur_aware_tracking()
+        motion_initialized = False
         if use_blur_tracking:
             ensure_blur_motion_params(viewpoint)
+            prev_prev = self.cameras.get(cur_frame_idx - 2 * self.use_every_n_frames)
+            motion_initialized = initialize_blur_motion_from_previous_frame(
+                viewpoint, prev, prev_prev, self.blur_tracking_cfg
+            )
 
         opt_params = []
         opt_params.append(
@@ -396,8 +458,11 @@ class FrontEnd(mp.Process):
         )
 
         pose_optimizer = torch.optim.Adam(opt_params)
+        last_tracking_itr = -1
+        last_loss_tracking = None
         try:
             for tracking_itr in range(self.tracking_itr_num):
+                last_tracking_itr = tracking_itr
                 if use_blur_tracking:
                     render_pkg = render_blur_aware_tracking(
                         viewpoint,
@@ -430,6 +495,7 @@ class FrontEnd(mp.Process):
                     loss_tracking = loss_tracking + blur_motion_l2(
                         viewpoint, self.blur_tracking_cfg
                     )
+                last_loss_tracking = loss_tracking
                 loss_tracking.backward()
 
                 with torch.no_grad():
@@ -448,10 +514,22 @@ class FrontEnd(mp.Process):
                             ),
                         )
                     )
-                if converged:
+                if use_blur_tracking:
+                    if should_stop_blur_tracking(
+                        converged, tracking_itr, self.blur_tracking_cfg
+                    ):
+                        break
+                elif converged:
                     break
         finally:
             if use_blur_tracking:
+                self.record_blur_tracking_debug(
+                    cur_frame_idx,
+                    last_tracking_itr,
+                    last_loss_tracking,
+                    viewpoint,
+                    motion_initialized,
+                )
                 reset_blur_motion(viewpoint)
 
         self.median_depth = get_median_depth(depth, opacity)
@@ -652,6 +730,7 @@ class FrontEnd(mp.Process):
                     if hasattr(self.dataset, "log_feature_stats"):
                         self.dataset.log_feature_stats(" (frontend)")
                     log_uncertainty_debug_stats(" (frontend)")
+                    self.log_blur_tracking_debug_stats(" (frontend)")
                     break
 
                 if self.requested_init:

@@ -5,6 +5,8 @@
 把 BARD-GS 的“曝光时间内多虚拟相机渲染并平均”的思想，轻量嵌入 MonoGS 前端 tracking。
 
 当前 MonoGS 每帧只优化一个相机位姿，并用单次渲染图和输入图计算 tracking loss。改进后，对疑似模糊帧在曝光窗口内采样少量虚拟位姿，分别渲染，再平均成预测模糊图，与输入模糊图计算 loss。
+当前 MonoGS 的虚拟位姿是在线优化/在线训练式的：在每帧 frontend tracking 过程中临时优化 blur_rot_delta / blur_trans_delta，tracking 结束后清零，不进入后端长期地图优化。
+
 
 目标优先级：
 
@@ -176,7 +178,7 @@ tracking 完成后：
 2. `num_virtual_views=1` 时近似等价于原 tracking。
 3. `num_virtual_views=3` 能正常运行，无 shape/device 错误。
 
-### 阶段 B：稳定版本
+### 阶段 B：稳定版本（目前实现的版本）
 
 加入：
 
