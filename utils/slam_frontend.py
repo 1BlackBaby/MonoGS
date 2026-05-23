@@ -17,6 +17,12 @@ from utils.blur_tracking import (
 from utils.camera_utils import Camera
 from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
+from utils.lsg_features import LSGFeatureMatcher
+from utils.lsg_pose_init import (
+    estimate_pose_from_matches,
+    get_lsg_pose_init_config,
+    pose_delta_reason,
+)
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import reset_blur_motion, update_pose
 from utils.slam_utils import (
@@ -72,6 +78,8 @@ class FrontEnd(mp.Process):
         self.blur_tracking_cfg = get_blur_tracking_config(config)
         self._logged_blur_tracking_warmup = False
         self._logged_blur_tracking_enabled = False
+        self.lsg_pose_init_cfg = get_lsg_pose_init_config(config)
+        self.lsg_feature_matcher = None
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -91,6 +99,7 @@ class FrontEnd(mp.Process):
             "tracking_warmup_backend_syncs", 0
         )
         self.blur_tracking_cfg = get_blur_tracking_config(self.config)
+        self.lsg_pose_init_cfg = get_lsg_pose_init_config(self.config)
 
     def use_blur_aware_tracking(self):
         if not self.blur_tracking_cfg["enabled"]:
@@ -191,8 +200,161 @@ class FrontEnd(mp.Process):
             )
         return float(loss.detach().cpu().item())
 
+    def get_lsg_feature_matcher(self):
+        if self.lsg_feature_matcher is None:
+            self.lsg_feature_matcher = LSGFeatureMatcher(
+                self.lsg_pose_init_cfg, self.device
+            )
+        return self.lsg_feature_matcher
+
+    def get_lsg_reference_keyframe(self):
+        if len(self.current_window) > 0:
+            return self.current_window[0]
+        if len(self.kf_indices) > 0:
+            return self.kf_indices[-1]
+        return None
+
+    def get_lsg_reference_depth(self, viewpoint):
+        priors = getattr(viewpoint, "priors", {}) or {}
+        for key in ("lsg_keyframe_depth", "rendered_depth", "metric_depth"):
+            if key in priors and priors[key] is not None:
+                return priors[key]
+        return viewpoint.depth
+
+    def log_lsg_pose_init(
+        self,
+        cur_frame_idx,
+        ref_idx,
+        matches=0,
+        inliers=0,
+        accepted=False,
+        reason="",
+    ):
+        if not self.lsg_pose_init_cfg.get("log_every_frame", True):
+            return
+        print(
+            "[LSG PoseInit] "
+            f"frame={cur_frame_idx}, ref={ref_idx}, matches={matches}, "
+            f"inliers={inliers}, accepted={accepted}, reason={reason}"
+        )
+
+    def try_lsg_pose_init(self, cur_frame_idx, viewpoint, prev):
+        cfg = self.lsg_pose_init_cfg
+        if not cfg.get("enabled", False):
+            return False
+        if cfg.get("pose_after_init", True) and not self.initialized:
+            self.log_lsg_pose_init(
+                cur_frame_idx, None, accepted=False, reason="waiting for init"
+            )
+            return False
+
+        ref_idx = self.get_lsg_reference_keyframe()
+        ref = self.cameras.get(ref_idx) if ref_idx is not None else None
+        if ref is None:
+            self.log_lsg_pose_init(
+                cur_frame_idx, ref_idx, accepted=False, reason="missing reference"
+            )
+            return False
+
+        ref_depth = self.get_lsg_reference_depth(ref)
+        if ref_depth is None:
+            self.log_lsg_pose_init(
+                cur_frame_idx, ref_idx, accepted=False, reason="missing ref depth"
+            )
+            return False
+
+        matcher = self.get_lsg_feature_matcher()
+        match_data, match_reason = matcher.match(viewpoint, ref)
+        if match_data is None:
+            self.log_lsg_pose_init(
+                cur_frame_idx, ref_idx, accepted=False, reason=match_reason
+            )
+            return False
+
+        result = estimate_pose_from_matches(
+            match_data["kpts_cur"],
+            match_data["kpts_ref"],
+            ref,
+            viewpoint,
+            ref_depth,
+            cfg,
+        )
+        if not result.accepted:
+            self.log_lsg_pose_init(
+                cur_frame_idx,
+                ref_idx,
+                matches=match_data["num_matches"],
+                inliers=result.num_inliers,
+                accepted=False,
+                reason=result.reason,
+            )
+            return False
+
+        prev_R = prev.R.detach().cpu()
+        prev_T = prev.T.detach().cpu()
+        median_depth = None
+        if hasattr(self, "median_depth"):
+            median_depth = float(self.median_depth.detach().cpu().item())
+        delta_ok, delta_reason = pose_delta_reason(
+            prev_R.tolist(),
+            prev_T.tolist(),
+            result.R.tolist(),
+            result.T.tolist(),
+            cfg,
+            median_depth=median_depth,
+        )
+        if not delta_ok:
+            self.log_lsg_pose_init(
+                cur_frame_idx,
+                ref_idx,
+                matches=match_data["num_matches"],
+                inliers=result.num_inliers,
+                accepted=False,
+                reason=delta_reason,
+            )
+            return False
+
+        candidate_R = torch.from_numpy(result.R).to(device=viewpoint.device)
+        candidate_T = torch.from_numpy(result.T).to(device=viewpoint.device)
+
+        if cfg.get("compare_init_loss", True) and self.gaussians is not None:
+            viewpoint.update_RT(candidate_R, candidate_T)
+            candidate_loss = self.tracking_init_loss(viewpoint)
+            viewpoint.update_RT(prev.R, prev.T)
+            fallback_loss = self.tracking_init_loss(viewpoint)
+            improvement = float(cfg.get("loss_improvement", 0.0))
+            if candidate_loss > fallback_loss * (1.0 - improvement):
+                self.log_lsg_pose_init(
+                    cur_frame_idx,
+                    ref_idx,
+                    matches=match_data["num_matches"],
+                    inliers=result.num_inliers,
+                    accepted=False,
+                    reason=(
+                        "init loss rejected "
+                        f"({candidate_loss:.6f} >= {fallback_loss:.6f})"
+                    ),
+                )
+                return False
+
+        viewpoint.update_RT(candidate_R, candidate_T)
+        self.log_lsg_pose_init(
+            cur_frame_idx,
+            ref_idx,
+            matches=match_data["num_matches"],
+            inliers=result.num_inliers,
+            accepted=True,
+            reason=(
+                f"inlier_ratio={result.inlier_ratio:.3f}, "
+                f"reproj={result.reproj_error:.3f}, {delta_reason}"
+            ),
+        )
+        return True
+
     def initialize_tracking_pose(self, cur_frame_idx, viewpoint, prev):
         viewpoint.update_RT(prev.R, prev.T)
+        if self.try_lsg_pose_init(cur_frame_idx, viewpoint, prev):
+            return
         if not gaustar_stage1_enabled(self.config):
             return
         if not getattr(prev, "priors", None) and prev.uid in self._gaustar_recent_priors:
@@ -251,6 +413,13 @@ class FrontEnd(mp.Process):
             )
             self._logged_flow_pose_fallback = True
 
+    def store_lsg_keyframe_depth(self, viewpoint, depth_map):
+        if not self.lsg_pose_init_cfg.get("enabled", False) or depth_map is None:
+            return
+        if hasattr(depth_map, "detach"):
+            depth_map = depth_map.detach().cpu().numpy()
+        viewpoint.priors["lsg_keyframe_depth"] = np.asarray(depth_map).copy()
+
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
         self.kf_indices.append(cur_frame_idx)
@@ -272,7 +441,9 @@ class FrontEnd(mp.Process):
                     mask=valid_rgb,
                 )
                 if metric_initial_depth is not None:
-                    return metric_initial_depth.cpu().numpy()[0]
+                    depth_map = metric_initial_depth.cpu().numpy()[0]
+                    self.store_lsg_keyframe_depth(viewpoint, depth_map)
+                    return depth_map
             if depth is None:
                 initial_depth = 2 * torch.ones(1, gt_img.shape[1], gt_img.shape[2])
                 initial_depth += torch.randn_like(initial_depth) * 0.3
@@ -313,11 +484,15 @@ class FrontEnd(mp.Process):
                     )
 
                 initial_depth[~valid_rgb] = 0  # Ignore the invalid rgb pixels
-            return initial_depth.cpu().numpy()[0]
+            depth_map = initial_depth.cpu().numpy()[0]
+            self.store_lsg_keyframe_depth(viewpoint, depth_map)
+            return depth_map
         # use the observed depth
         initial_depth = torch.from_numpy(viewpoint.depth).unsqueeze(0)
         initial_depth[~valid_rgb.cpu()] = 0  # Ignore the invalid rgb pixels
-        return initial_depth[0].numpy()
+        depth_map = initial_depth[0].numpy()
+        self.store_lsg_keyframe_depth(viewpoint, depth_map)
+        return depth_map
 
     def initialize(self, cur_frame_idx, viewpoint):
         self.initialized = not self.monocular
