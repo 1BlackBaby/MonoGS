@@ -60,6 +60,25 @@ def gaustar_stage1_enabled(config):
     return get_gaustar_stage1_config(config).get("enabled", False)
 
 
+def lsg_metric3d_depth_enabled(config):
+    training = config.get("Training", {})
+    lsg_cfg = training.get("lsg_slam", {})
+    pose_cfg = training.get("lsg_pose_init", {})
+    return bool(
+        lsg_cfg.get("enabled", False)
+        and pose_cfg.get("enabled", False)
+        and pose_cfg.get("use_metric3d_depth", False)
+    )
+
+
+def metric3d_depth_requested(config):
+    cfg = get_gaustar_stage1_config(config)
+    return bool(
+        (cfg.get("enabled", False) and cfg.get("use_metric3d_depth", True))
+        or lsg_metric3d_depth_enabled(config)
+    )
+
+
 def _first_npz_array(npz_data, preferred_keys):
     for key in preferred_keys:
         if key in npz_data:

@@ -134,6 +134,76 @@ PnP 结果写回方式：
 - ATE RMSE 应先下降，尤其低帧率、大视角变化、快速运动序列。
 - PSNR/SSIM/LPIPS 可能间接改善，但不作为本阶段主指标。
 
+### 1.7 Metric3D 深度先验辅助 LSG-PnP
+
+PnP 本质需要当前帧 2D 匹配点和参考帧 3D 世界点。对 RGB-D/stereo 输入，参考关键帧可以直接使用观测深度或双目深度；但对 monocular 输入，如果只依赖 MonoGS 初始化深度或渲染深度，尺度和局部几何误差会直接影响 PnP 平移估计。因此建议把 `gaustar_stage1` 中已有的 Metric3D 深度能力抽象为可被 LSG-SLAM 复用的单目深度先验，而不是让 LSG-PnP 强依赖 GauSTAR flow pose init。
+
+开关设计建议：
+
+```yaml
+Training:
+  lsg_slam:
+    enabled: true
+  lsg_pose_init:
+    enabled: true
+    use_metric3d_depth: true
+    metric3d_for_keyframe_depth: true
+    metric3d_filter_with_rendered_depth: true
+    metric3d_depth_priority: "after_lsg_keyframe"
+```
+
+Metric3D 是否启用不应只由 `gaustar_stage1.enabled` 决定。更合理的触发条件是：
+
+```text
+Metric3D 可用 =
+  gaustar_stage1.enabled && gaustar_stage1.use_metric3d_depth
+  OR
+  lsg_slam.enabled && lsg_pose_init.use_metric3d_depth
+```
+
+这样可以在 `gaustar_stage1.enabled=false` 时，单独验证 `LSG-PnP + Metric3D depth prior` 的收益，避免 GauSTAR flow pose init 和 LSG-PnP 的贡献混在一起。
+
+推荐数据流：
+
+1. Dataset 层根据“GauSTAR 或 LSG 任一模块请求 Metric3D”来读取或在线预测 `metric_depth`。
+2. `Camera.init_from_dataset()` 保留 `viewpoint.priors["metric_depth"]`。
+3. `FrontEnd.add_new_keyframe()` 在 monocular 模式下，如果 `lsg_pose_init.use_metric3d_depth=true`，优先用 Metric3D 生成关键帧参考深度。
+4. 如果配置 `metric3d_filter_with_rendered_depth=true`，则使用当前 rendered depth、opacity 和 RGB mask 做一致性过滤与尺度对齐，再保存为 `viewpoint.priors["lsg_keyframe_depth"]`。
+5. LSG-PnP 读取参考深度时优先使用 `lsg_keyframe_depth`，再按传感器类型 fallback 到其他深度来源。
+
+深度优先级建议按输入类型区分：
+
+```text
+RGB-D:
+  lsg_keyframe_depth -> viewpoint.depth -> metric_depth -> rendered_depth
+
+Monocular:
+  lsg_keyframe_depth -> metric_depth -> rendered_depth
+
+Stereo:
+  lsg_keyframe_depth -> stereo/depth prior -> metric_depth -> rendered_depth
+```
+
+这样可以避免 Metric3D 覆盖 RGB-D 真实传感器深度，同时让 monocular 场景获得 PnP 所需的相对稳定 3D 点。
+
+实现边界建议：
+
+- `gaustar_stage1.enabled` 继续控制 GauSTAR 自身的 flow pose init、rendered depth filter 和相关增强。
+- `lsg_pose_init.use_metric3d_depth` 只表示 LSG-PnP 请求 Metric3D 深度先验。
+- Dataset 层只关心是否有模块请求 Metric3D，不关心该深度最终服务于 GauSTAR 还是 LSG。
+- LSG-PnP 不应直接要求 `gaustar_stage1.enabled=true`，否则消融实验无法隔离 LSG 创新点。
+
+验收与消融建议：
+
+```text
+A. Baseline
+B. LSG-PnP only
+C. LSG-PnP + Metric3D depth
+D. LSG-PnP + Metric3D depth + rendered-depth consistency filter
+```
+
+主要观察 `PnP accepted rate`、`matches/inliers`、`reproj_error`、`ATE RMSE`、tracking reset/lost 次数和 FPS。预期收益主要体现在 monocular 或缺少可靠深度的配置；RGB-D 上 Metric3D 不应作为主深度来源，只作为 fallback 或对照实验。
+
 ## 阶段 2：8.2 Feature Warping Tracking Loss
 
 目标：tracking 优化过程中不只依赖渲染 RGB/depth loss，还用稀疏但可靠的特征几何约束持续拉住位姿。

@@ -52,7 +52,7 @@ Training:
   spherical_harmonics: False
 
   blur_aware_tracking:
-    enabled: True
+    enabled: False
     num_virtual_views: 3
     shutter_ratio: 0.5
     motion_l2: 0.05
@@ -64,15 +64,24 @@ Training:
     debug: False
 
   lsg_slam:
-    enabled: False
+    enabled: True
   lsg_pose_init:
-    enabled: False
+    enabled: True
     pose_after_init: True
     max_keypoints: 1024
     match_topk: 512
     min_matches: 20
     min_pnp_inliers: 20
     min_inlier_ratio: 0.25
+
+  lsg_feature_warping:
+    enabled: True
+    weight_warp: 0.1
+    min_matches_for_loss: 20
+    robust_beta: 0.1
+    normalize_pixels: True
+    warp_after_init: True
+    require_pose_init_accept: True
 
   gaustar_stage1:
     enabled: False

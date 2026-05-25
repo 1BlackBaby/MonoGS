@@ -2,6 +2,11 @@ import torch
 import torch.nn.functional as F
 
 from utils.dyn_uncertainty import mapping_utils
+from utils.lsg_pose_init import get_lsg_pose_init_config
+from utils.lsg_warp_loss import (
+    compute_lsg_warp_loss,
+    get_lsg_feature_warping_config,
+)
 from utils.mono_priors.gaustar_stage1 import (
     build_depth_consistency_mask,
     gaustar_stage1_enabled,
@@ -121,14 +126,35 @@ def build_rendered_depth_consistency_mask(config, depth, opacity, viewpoint):
         return mask.to(device=depth.device, dtype=torch.bool)
 
 
-def get_metric_depth_for_initialization(config, viewpoint, depth=None, opacity=None, mask=None):
-    if not gaustar_stage1_enabled(config):
-        return None
+def get_metric_depth_for_initialization(
+    config, viewpoint, depth=None, opacity=None, mask=None, use_lsg_metric3d=False
+):
     cfg = get_gaustar_stage1_config(config)
-    if not cfg.get("use_metric3d_depth", True):
-        return None
+    if use_lsg_metric3d:
+        lsg_cfg = get_lsg_pose_init_config(config)
+        if (
+            not lsg_cfg.get("enabled", False)
+            or not lsg_cfg.get("use_metric3d_depth", False)
+            or not lsg_cfg.get("metric3d_for_keyframe_depth", True)
+        ):
+            return None
+        filter_with_rendered_depth = lsg_cfg.get(
+            "metric3d_filter_with_rendered_depth", True
+        )
+        require_rendered_depth = filter_with_rendered_depth
+    else:
+        if not gaustar_stage1_enabled(config):
+            return None
+        if not cfg.get("use_metric3d_depth", True):
+            return None
+        require_rendered_depth = cfg.get(
+            "require_rendered_depth_for_keyframe_depth", True
+        )
+        filter_with_rendered_depth = depth is not None and opacity is not None
+        if filter_with_rendered_depth and not cfg.get("use_rendered_depth_filter", True):
+            return None
     if (
-        cfg.get("require_rendered_depth_for_keyframe_depth", True)
+        require_rendered_depth
         and (depth is None or opacity is None)
     ):
         return None
@@ -144,13 +170,14 @@ def get_metric_depth_for_initialization(config, viewpoint, depth=None, opacity=N
     if mask is not None:
         valid = torch.logical_and(valid, mask.to(device=device, dtype=torch.bool))
 
-    if depth is not None and opacity is not None:
-        consistency_mask = build_rendered_depth_consistency_mask(
-            config, depth, opacity, viewpoint
+    if filter_with_rendered_depth and depth is not None and opacity is not None:
+        prior_valid_mask = priors.get("prior_valid_mask")
+        consistency_mask, scale = build_depth_consistency_mask(
+            metric, depth, opacity, cfg, prior_valid_mask=prior_valid_mask
         )
-        scale = priors.get("depth_scale", None)
         if consistency_mask is None or scale is None:
             return None
+        priors["depth_scale"] = float(scale.detach().cpu().item())
         valid = torch.logical_and(valid, consistency_mask)
         metric = metric * float(scale)
 
@@ -231,12 +258,26 @@ def get_loss_tracking(
 ):
     image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
     if config["Training"]["monocular"]:
-        return get_loss_tracking_rgb(
+        loss = get_loss_tracking_rgb(
             config, image_ab, depth, opacity, viewpoint, uncertainty_network
         )
-    return get_loss_tracking_rgbd(
-        config, image_ab, depth, opacity, viewpoint, uncertainty_network=uncertainty_network
-    )
+    else:
+        loss = get_loss_tracking_rgbd(
+            config,
+            image_ab,
+            depth,
+            opacity,
+            viewpoint,
+            uncertainty_network=uncertainty_network,
+        )
+    warp_cfg = get_lsg_feature_warping_config(config)
+    if warp_cfg.get("enabled", False):
+        warp_loss, warp_stats = compute_lsg_warp_loss(
+            viewpoint, getattr(viewpoint, "lsg_match_data", None), warp_cfg
+        )
+        viewpoint.lsg_warp_stats = warp_stats
+        loss = loss + warp_loss
+    return loss
 
 
 def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint, uncertainty_network=None):

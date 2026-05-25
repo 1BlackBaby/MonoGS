@@ -32,6 +32,61 @@ class LSGPoseInitTest(unittest.TestCase):
 
         self.assertGreaterEqual(cfg["min_pnp_points"], cfg["min_pnp_inliers"])
 
+    def test_lsg_metric3d_request_does_not_require_gaustar_enabled(self):
+        try:
+            from utils.mono_priors.gaustar_stage1 import metric3d_depth_requested
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"mono prior dependencies are not installed: {exc}")
+
+        config = {
+            "Training": {
+                "lsg_slam": {"enabled": True},
+                "lsg_pose_init": {
+                    "enabled": True,
+                    "use_metric3d_depth": True,
+                },
+                "gaustar_stage1": {"enabled": False, "use_metric3d_depth": False},
+            }
+        }
+
+        self.assertTrue(metric3d_depth_requested(config))
+
+    def test_lsg_metric3d_initialization_is_behind_lsg_switches(self):
+        try:
+            import torch
+
+            from utils.slam_utils import get_metric_depth_for_initialization
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"mono prior dependencies are not installed: {exc}")
+
+        class FakeViewpoint:
+            original_image = torch.zeros(3, 2, 2)
+            priors = {"metric_depth": torch.ones(2, 2)}
+
+        base_config = {
+            "Training": {
+                "lsg_slam": {"enabled": True},
+                "lsg_pose_init": {
+                    "enabled": True,
+                    "use_metric3d_depth": True,
+                    "metric3d_for_keyframe_depth": True,
+                    "metric3d_filter_with_rendered_depth": False,
+                },
+                "gaustar_stage1": {"enabled": False},
+            }
+        }
+
+        depth = get_metric_depth_for_initialization(
+            base_config, FakeViewpoint(), use_lsg_metric3d=True
+        )
+        self.assertIsNotNone(depth)
+
+        base_config["Training"]["lsg_pose_init"]["use_metric3d_depth"] = False
+        depth = get_metric_depth_for_initialization(
+            base_config, FakeViewpoint(), use_lsg_metric3d=True
+        )
+        self.assertIsNone(depth)
+
     def test_estimate_pose_from_2d3d_recovers_w2c_pose(self):
         try:
             import cv2

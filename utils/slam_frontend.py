@@ -26,6 +26,11 @@ from utils.lsg_pose_init import (
     get_lsg_pose_init_config,
     pose_delta_reason,
 )
+from utils.lsg_warp_loss import (
+    build_lsg_warp_match_data,
+    get_lsg_feature_warping_config,
+    should_prepare_lsg_warp_match_data,
+)
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import reset_blur_motion, update_pose
 from utils.slam_utils import (
@@ -90,7 +95,9 @@ class FrontEnd(mp.Process):
             "trans_norm_max": 0.0,
         }
         self.lsg_pose_init_cfg = get_lsg_pose_init_config(config)
+        self.lsg_warp_loss_cfg = get_lsg_feature_warping_config(config)
         self.lsg_feature_matcher = None
+        self._logged_lsg_warp_loss = False
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -111,6 +118,7 @@ class FrontEnd(mp.Process):
         )
         self.blur_tracking_cfg = get_blur_tracking_config(self.config)
         self.lsg_pose_init_cfg = get_lsg_pose_init_config(self.config)
+        self.lsg_warp_loss_cfg = get_lsg_feature_warping_config(self.config)
 
     def use_blur_aware_tracking(self):
         if not self.blur_tracking_cfg["enabled"]:
@@ -259,10 +267,51 @@ class FrontEnd(mp.Process):
 
     def get_lsg_feature_matcher(self):
         if self.lsg_feature_matcher is None:
+            matcher_cfg = dict(self.lsg_pose_init_cfg)
+            matcher_cfg.update(self.lsg_warp_loss_cfg)
             self.lsg_feature_matcher = LSGFeatureMatcher(
-                self.lsg_pose_init_cfg, self.device
+                matcher_cfg, self.device
             )
         return self.lsg_feature_matcher
+
+    def store_lsg_warp_match_data(self, viewpoint, ref_idx, ref, ref_depth, match_data):
+        if not self.lsg_warp_loss_cfg.get("enabled", False):
+            return
+        viewpoint.lsg_match_data = build_lsg_warp_match_data(
+            ref_idx, match_data, ref, ref_depth, viewpoint.device
+        )
+
+    def prepare_lsg_warp_match_data(self, cur_frame_idx, viewpoint):
+        allowed, reason = should_prepare_lsg_warp_match_data(
+            self.lsg_warp_loss_cfg,
+            self.initialized,
+            pose_init_enabled=self.lsg_pose_init_cfg.get("enabled", False),
+            pose_init_accepted=getattr(viewpoint, "lsg_pose_init_accepted", None),
+        )
+        if not allowed:
+            viewpoint.lsg_warp_stats = {"used_matches": 0, "reason": reason}
+            return
+        if getattr(viewpoint, "lsg_match_data", None) is not None:
+            return
+
+        ref_idx = self.get_lsg_reference_keyframe()
+        ref = self.cameras.get(ref_idx) if ref_idx is not None else None
+        if ref is None:
+            viewpoint.lsg_warp_stats = {"used_matches": 0, "reason": "missing reference"}
+            return
+
+        ref_depth = self.get_lsg_reference_depth(ref)
+        if ref_depth is None:
+            viewpoint.lsg_warp_stats = {"used_matches": 0, "reason": "missing ref depth"}
+            return
+
+        matcher = self.get_lsg_feature_matcher()
+        match_data, match_reason = matcher.match(viewpoint, ref)
+        if match_data is None:
+            viewpoint.lsg_warp_stats = {"used_matches": 0, "reason": match_reason}
+            return
+
+        self.store_lsg_warp_match_data(viewpoint, ref_idx, ref, ref_depth, match_data)
 
     def get_lsg_reference_keyframe(self):
         if len(self.current_window) > 0:
@@ -273,9 +322,24 @@ class FrontEnd(mp.Process):
 
     def get_lsg_reference_depth(self, viewpoint):
         priors = getattr(viewpoint, "priors", {}) or {}
-        for key in ("lsg_keyframe_depth", "rendered_depth", "metric_depth"):
-            if key in priors and priors[key] is not None:
-                return priors[key]
+        depth = priors.get("lsg_keyframe_depth")
+        if depth is not None:
+            return depth
+        metric_depth = None
+        if self.lsg_pose_init_cfg.get("use_metric3d_depth", False):
+            metric_depth = priors.get("metric_depth")
+        if not self.monocular and viewpoint.depth is not None:
+            return viewpoint.depth
+        rendered_depth = priors.get("rendered_depth")
+        metric_priority = self.lsg_pose_init_cfg.get(
+            "metric3d_depth_priority", "after_lsg_keyframe"
+        )
+        if metric_priority != "after_rendered_depth" and metric_depth is not None:
+            return metric_depth
+        if rendered_depth is not None:
+            return rendered_depth
+        if metric_depth is not None:
+            return metric_depth
         return viewpoint.depth
 
     def log_lsg_pose_init(
@@ -299,6 +363,7 @@ class FrontEnd(mp.Process):
         cfg = self.lsg_pose_init_cfg
         if not cfg.get("enabled", False):
             return False
+        viewpoint.lsg_pose_init_accepted = False
         if cfg.get("pose_after_init", True) and not self.initialized:
             self.log_lsg_pose_init(
                 cur_frame_idx, None, accepted=False, reason="waiting for init"
@@ -395,6 +460,8 @@ class FrontEnd(mp.Process):
                 return False
 
         viewpoint.update_RT(candidate_R, candidate_T)
+        viewpoint.lsg_pose_init_accepted = True
+        self.store_lsg_warp_match_data(viewpoint, ref_idx, ref, ref_depth, match_data)
         self.log_lsg_pose_init(
             cur_frame_idx,
             ref_idx,
@@ -409,6 +476,11 @@ class FrontEnd(mp.Process):
         return True
 
     def initialize_tracking_pose(self, cur_frame_idx, viewpoint, prev):
+        if hasattr(viewpoint, "lsg_match_data"):
+            del viewpoint.lsg_match_data
+        if hasattr(viewpoint, "lsg_warp_stats"):
+            del viewpoint.lsg_warp_stats
+        viewpoint.lsg_pose_init_accepted = None
         viewpoint.update_RT(prev.R, prev.T)
         if self.try_lsg_pose_init(cur_frame_idx, viewpoint, prev):
             return
@@ -484,6 +556,23 @@ class FrontEnd(mp.Process):
         gt_img = viewpoint.original_image.cuda()
         valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]
         if self.monocular:
+            if (
+                self.lsg_pose_init_cfg.get("enabled", False)
+                and self.lsg_pose_init_cfg.get("use_metric3d_depth", False)
+                and self.lsg_pose_init_cfg.get("metric3d_for_keyframe_depth", True)
+            ):
+                metric_initial_depth = get_metric_depth_for_initialization(
+                    self.config,
+                    viewpoint,
+                    depth=depth,
+                    opacity=opacity,
+                    mask=valid_rgb,
+                    use_lsg_metric3d=True,
+                )
+                if metric_initial_depth is not None:
+                    depth_map = metric_initial_depth.cpu().numpy()[0]
+                    self.store_lsg_keyframe_depth(viewpoint, depth_map)
+                    return depth_map
             gaustar_cfg = self.gaustar_stage1_cfg
             if (
                 gaustar_stage1_enabled(self.config)
@@ -572,6 +661,7 @@ class FrontEnd(mp.Process):
     def tracking(self, cur_frame_idx, viewpoint):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         self.initialize_tracking_pose(cur_frame_idx, viewpoint, prev)
+        self.prepare_lsg_warp_match_data(cur_frame_idx, viewpoint)
         use_blur_tracking = self.use_blur_aware_tracking()
         motion_initialized = False
         if use_blur_tracking:
@@ -666,6 +756,18 @@ class FrontEnd(mp.Process):
                     viewpoint,
                     uncertainty_network=self.get_tracking_uncertainty_network(),
                 )
+                if (
+                    self.lsg_warp_loss_cfg.get("enabled", False)
+                    and not self._logged_lsg_warp_loss
+                ):
+                    stats = getattr(viewpoint, "lsg_warp_stats", {})
+                    print(
+                        "[LSG WarpLoss] "
+                        f"frame={cur_frame_idx}, "
+                        f"used_matches={stats.get('used_matches', 0)}, "
+                        f"reason={stats.get('reason', 'not_computed')}"
+                    )
+                    self._logged_lsg_warp_loss = True
                 if use_blur_tracking:
                     loss_tracking = loss_tracking + blur_motion_l2(
                         viewpoint, self.blur_tracking_cfg

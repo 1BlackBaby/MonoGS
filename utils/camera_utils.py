@@ -73,7 +73,7 @@ class Camera(nn.Module):
         data = dataset[idx]
         priors = None
         if len(data) > 3 and isinstance(data[-1], dict) and data[-1].get(
-            "gaustar_stage1", False
+            "mono_priors", data[-1].get("gaustar_stage1", False)
         ):
             priors = data[-1]
             data = data[:-1]
@@ -167,6 +167,12 @@ class Camera(nn.Module):
         self.features = None
         if hasattr(self, "lsg_local_features"):
             del self.lsg_local_features
+        if hasattr(self, "lsg_match_data"):
+            del self.lsg_match_data
+        if hasattr(self, "lsg_warp_stats"):
+            del self.lsg_warp_stats
+        if hasattr(self, "lsg_pose_init_accepted"):
+            del self.lsg_pose_init_accepted
         self.priors = {}
         self.grad_mask = None
 

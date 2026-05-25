@@ -16,6 +16,7 @@ from utils.mono_priors.gaustar_stage1 import (
     load_flow_file,
     load_metric_depth_file,
     load_prior_mask_file,
+    metric3d_depth_requested,
     predict_metric3d_depth,
     save_metric_depth_file,
 )
@@ -224,6 +225,9 @@ class BaseDataset(torch.utils.data.Dataset):
         self._feature_extractor = None
         self._feature_extractor_failed = False
         self.use_gaustar_stage1 = gaustar_stage1_enabled(config)
+        self.use_mono_priors = self.use_gaustar_stage1 or metric3d_depth_requested(
+            config
+        )
         self.gaustar_stage1_cfg = get_gaustar_stage1_config(config)
         dataset_cfg = config.get("Dataset", {})
         self.mono_prior_path = dataset_cfg.get("mono_prior_path", "")
@@ -337,10 +341,7 @@ class BaseDataset(torch.utils.data.Dataset):
         return depth.detach().cpu()
 
     def load_metric_depth(self, idx, target_shape, image=None):
-        if (
-            not self.use_gaustar_stage1
-            or not self.gaustar_stage1_cfg.get("use_metric3d_depth", True)
-        ):
+        if not metric3d_depth_requested(self.config):
             return None
         if self.metric3d_depth_path:
             roots = [self.metric3d_depth_path]
@@ -459,9 +460,11 @@ class BaseDataset(torch.utils.data.Dataset):
         return torch.from_numpy(mask)
 
     def load_gaustar_priors(self, idx, target_shape, image=None):
-        if not self.use_gaustar_stage1:
+        if not self.use_mono_priors:
             return None
-        priors = {"gaustar_stage1": True}
+        priors = {"mono_priors": True}
+        if self.use_gaustar_stage1:
+            priors["gaustar_stage1"] = True
         metric_depth = self.load_metric_depth(idx, target_shape, image=image)
         if metric_depth is not None:
             priors["metric_depth"] = metric_depth
@@ -700,10 +703,10 @@ class MonocularDataset(BaseDataset):
         features = self.load_features(idx, image=image)
         priors = self.load_gaustar_priors(idx, (self.height, self.width), image=image)
         if self.use_uncertainty:
-            if self.use_gaustar_stage1:
+            if self.use_mono_priors:
                 return image, depth, pose, features, priors
             return image, depth, pose, features
-        if self.use_gaustar_stage1:
+        if self.use_mono_priors:
             return image, depth, pose, priors
         return image, depth, pose
 
@@ -823,10 +826,10 @@ class StereoDataset(BaseDataset):
         features = self.load_features(idx, image=image)
         priors = self.load_gaustar_priors(idx, (self.height, self.width), image=image)
         if self.use_uncertainty:
-            if self.use_gaustar_stage1:
+            if self.use_mono_priors:
                 return image, depth, pose, features, priors
             return image, depth, pose, features
-        if self.use_gaustar_stage1:
+        if self.use_mono_priors:
             return image, depth, pose, priors
         return image, depth, pose
 
@@ -957,10 +960,10 @@ class RealsenseDataset(BaseDataset):
         features = self.load_features(idx, image=image)
         priors = self.load_gaustar_priors(idx, (self.height, self.width), image=image)
         if self.use_uncertainty:
-            if self.use_gaustar_stage1:
+            if self.use_mono_priors:
                 return image, depth, pose, features, priors
             return image, depth, pose, features
-        if self.use_gaustar_stage1:
+        if self.use_mono_priors:
             return image, depth, pose, priors
         return image, depth, pose
 

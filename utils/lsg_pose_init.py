@@ -24,6 +24,10 @@ DEFAULT_LSG_POSE_INIT_CFG = {
     "essential_threshold": 1.0,
     "log_every_frame": True,
     "feature_model_root": "",
+    "use_metric3d_depth": False,
+    "metric3d_for_keyframe_depth": True,
+    "metric3d_filter_with_rendered_depth": True,
+    "metric3d_depth_priority": "after_lsg_keyframe",
 }
 
 
